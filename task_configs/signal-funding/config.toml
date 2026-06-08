@@ -1,0 +1,47 @@
+# Signal-Funding Task Configuration
+# Funding rate contrarian signal
+
+[metadata]
+name = "signal-funding"
+type = "signal"
+difficulty = "medium"
+tags = ["signal", "funding", "contrarian", "mean-reversion", "crypto"]
+description = "Build contrarian signal from funding rate"
+
+[resources]
+# All defaults from signal_shared.py
+
+[instruction]
+title = "Funding Rate Contrarian Signal Task"
+
+objective = """
+Funding is used in perpetual futures markets to rectify the difference between where spot and futures are trading.
+For example, if futures_price > spot_price, funding is positive, forcing longs to pay shorts to try push the price back down. 
+
+Funding is best thought of as:
+The implied financing rate of leverage in the perp market
+Positive funding = market paying to be levered long
+Negative funding = market paying to be levered short
+
+This makes funding rates a sentiment + positioning indicator, not just a fee.
+Assets with high funding rates (where longs are paying shorts) represent crowded long positions, 
+and assets with low funding rates (shorts paying longs) represent the inverese situation. 
+
+
+"""
+
+allowed_features = ["funding_rate", "volume", "close"]
+
+ideas = [
+    """
+    Finding a signal that works may require testing a bunch of variations: 
+     - think about what the data means and compare that with what empirical tests show: 
+        - Funding represents demand for leverage. How should this influence returns? 
+        - Other features contextualize this: open interest, volume, trailing return, volatility
+        - Do these flows behave the same in times of market stress vs exuberance?
+    - aggregating different sub-features into the signal with a rolling linear regression fit against no
+    - consider if this effect is a conditioner for a simple momentum, mean reversion or volume signal
+    - different normalizations of features both temporally (i.e time series z score) or cross-sectionally
+    """,
+    "Note that turnover may be an issue. If you are finding fitting to 1 period returns is too fast, calculate longer term forward returns and use that to fit any rolling fit signals. Make sure to correctly mask returns though. For example if your forward horizon is K, your rolling window for time T should end data at time T-K.",
+]

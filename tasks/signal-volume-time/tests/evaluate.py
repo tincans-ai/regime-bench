@@ -1,0 +1,2984 @@
+"""Evaluation script for the volume signal task with enhanced metrics and LLM judge.
+
+This script:
+1. Loads the agent's signal from /app/starter_code/code.py
+2. Loads the held-out test data (not visible to agent)
+3. Computes comprehensive metrics (IC, DK t-stat, signal Sharpe, etc.)
+4. Generates plots (IC over time, IC decay, equity curve)
+5. Calls LLM judge with visual analysis
+6. Saves results to /app/output/results.json
+
+The agent cannot modify this file - it runs after the agent completes.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import contextlib
+import io
+import json
+import os
+import re
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import matplotlib
+
+matplotlib.use("Agg")  # Non-interactive backend for Docker
+import matplotlib.pyplot as plt
+import numpy as np
+import polars as pl
+
+# Import public benchmark backtest shim. If a separate alphalib
+# installation is present, the task remains compatible with it.
+try:
+    from alphalib.backtest import BacktestConfig, Backtester
+    from alphalib.data import WideMatrix
+except ImportError:
+    from pnl_engine import BacktestConfig, Backtester, WideMatrix
+from scipy import stats
+
+# Constants
+TIMEFRAME_MINUTES = 60
+EPS = 1e-8
+
+# =============================================================================
+# Grading thresholds used by the public benchmark verifier.
+# =============================================================================
+
+# Core metrics: t-stat (40%), Sharpe (60%), Autocorrelation (penalty up to -0.4)
+TSTAT_THRESHOLD = 1.0  # Statistical significance
+
+SHARPE_THRESHOLD = 0.7  # Minimum useful Sharpe
+
+AUTOCORR_OPTIMAL_LOW = 0.50
+AUTOCORR_OPTIMAL_HIGH = 0.999
+AUTOCORR_PENALTY_MAX = 0.40  # Max penalty for very low autocorrelation
+AUTOCORR_PENALTY_FLOOR = 0.10  # Below this = full penalty
+
+# Implausibility thresholds (likely predicting current returns, not next-period)
+IMPLAUSIBLE_SHARPE = 7.0  # Even in crypto, >7 Sharpe is suspect
+IMPLAUSIBLE_IC = 0.05  # IC > 0.05 is unrealistic (IC = mean(z_signal * return))
+IMPLAUSIBLE_IC_POSITIVE_PCT = 0.95  # >95% positive IC is too good
+
+# Minimum score for valid output (rewards proper formatting)
+MIN_SCORE_VALID_OUTPUT = 0.05
+
+# Weights for composite score (autocorr is a penalty, not a weight)
+WEIGHT_TSTAT = 0.40
+WEIGHT_SHARPE = 0.60
+
+# Return column to evaluate against (configurable per task)
+# - "residual_return": Market-adjusted returns (removes systematic exposure)
+# - "return": Raw returns (includes market beta)
+RETURN_COLUMN_NAME = "residual_return"
+RESIDUAL_RETURN_COLUMN_NAME = "residual_return"
+
+BARS_PER_FUNDING = (8 * 60) // TIMEFRAME_MINUTES  # 15m bars per 8h funding period
+ANN_FACTOR = (365 * 60 * 24) // TIMEFRAME_MINUTES  # bars per year for annualization
+SAFE_RETURN_LAGS = (1, 2, 3, 6, 12, 24)
+
+
+def _env_enabled(name: str, default: bool = True) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def _write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2, default=str)
+
+
+def _source_policy_violations(code_path: Path) -> list[str]:
+    """Detect obvious hidden-data access in submitted code.
+
+    We intentionally do not reject every ``shift(-1)`` here. Some submissions
+    build forward-return labels for walk-forward fitting on visible train rows.
+    Hidden-label safety is enforced by the final verifier input, where hidden
+    prediction rows have return-like labels nulled before submitted code sees
+    them.
+    """
+    if not _env_enabled("QR_EVAL_REJECT_LOOKAHEAD_CODE", default=True):
+        return []
+    try:
+        source = code_path.read_text(errors="replace")
+    except Exception as exc:
+        return [f"could not read submitted code for policy scan: {exc}"]
+
+    checks = [
+        (
+            re.compile(r"['\"][^'\"]*/tests/[^'\"]*['\"]"),
+            "direct /tests path access is not allowed",
+        ),
+        (
+            re.compile(r"['\"][^'\"]*test\.parquet[^'\"]*['\"]"),
+            "direct test.parquet access is not allowed",
+        ),
+        (
+            re.compile(r"['\"][^'\"]*val\.parquet[^'\"]*['\"]"),
+            "direct val.parquet access is not allowed",
+        ),
+    ]
+    return [message for pattern, message in checks if pattern.search(source)]
+
+
+def _policy_failure_result(violations: list[str]) -> dict[str, Any]:
+    return {
+        "error": "Submitted code violates the signal evaluation policy",
+        "policy_violations": violations,
+        "cheating_detected": True,
+        "passed": False,
+        "score": 0.0,
+    }
+
+
+def _return_columns_for(df: pl.DataFrame) -> list[str]:
+    return list(
+        dict.fromkeys(
+            col
+            for col in [RETURN_COLUMN_NAME, RESIDUAL_RETURN_COLUMN_NAME, "return"]
+            if col in df.columns
+        )
+    )
+
+
+def _sort_columns_for(df: pl.DataFrame) -> list[str]:
+    return [col for col in ["ticker", "timestamp_agg"] if col in df.columns]
+
+
+def _with_safe_return_lags(df: pl.DataFrame, return_columns: list[str]) -> pl.DataFrame:
+    lag_exprs: list[pl.Expr] = []
+    for column in return_columns:
+        for lag in SAFE_RETURN_LAGS:
+            lag_exprs.append(
+                pl.col(column)
+                .shift(lag)
+                .over("ticker")
+                .alias(f"{column}_lag{lag}")
+            )
+    return df.with_columns(lag_exprs) if lag_exprs else df
+
+
+def _sanitize_prediction_returns(
+    df: pl.DataFrame,
+    return_columns: list[str],
+    *,
+    prediction_col: str = "is_prediction_period",
+) -> pl.DataFrame:
+    mode = os.environ.get("QR_EVAL_HIDDEN_RETURN_MODE", "null").strip().lower()
+    if mode in {"raw", "none"}:
+        return df
+
+    exprs: list[pl.Expr] = []
+    for column in return_columns:
+        if mode == "lagged" and f"{column}_lag1" in df.columns:
+            hidden_value = pl.col(f"{column}_lag1")
+        else:
+            if mode not in {"null", "drop", "lagged"}:
+                print(f"[evaluate] Unknown QR_EVAL_HIDDEN_RETURN_MODE={mode!r}; using null mode")
+            hidden_value = pl.lit(None, dtype=df.schema[column])
+        exprs.append(
+            pl.when(pl.col(prediction_col))
+            .then(hidden_value)
+            .otherwise(pl.col(column))
+            .alias(column)
+        )
+    return df.with_columns(exprs) if exprs else df
+
+
+def _hidden_feature_frame(hidden_df: pl.DataFrame) -> pl.DataFrame:
+    """Create the data view passed to submitted code during hidden OOS evaluation.
+
+    The verifier keeps the true hidden returns in memory for scoring. The submitted
+    signal code receives a safer copy where return-like columns are nulled, plus
+    explicit lag features. This preserves common lagged-return strategies while
+    blocking one-period target leakage from the raw hidden labels.
+    """
+    sort_cols = _sort_columns_for(hidden_df)
+    feature_df = hidden_df.sort(sort_cols) if sort_cols else hidden_df
+    return_columns = _return_columns_for(feature_df)
+    feature_df = _with_safe_return_lags(feature_df, return_columns)
+    feature_df = feature_df.with_columns(pl.lit(True).alias("is_prediction_period"))
+    return _sanitize_prediction_returns(feature_df, return_columns)
+
+
+def _final_eval_feature_frame(train_df: pl.DataFrame | None, hidden_df: pl.DataFrame) -> pl.DataFrame:
+    """Create the one-shot final eval input for submitted code.
+
+    Visible train rows keep return labels and can be used for fitting. Hidden
+    prediction rows keep features but have return-like labels nulled before the
+    submission sees them. The verifier scores only prediction rows against the
+    true hidden returns retained in memory.
+    """
+    frames: list[pl.DataFrame] = []
+    if train_df is not None:
+        frames.append(train_df.with_columns(pl.lit(False).alias("is_prediction_period")))
+    frames.append(hidden_df.with_columns(pl.lit(True).alias("is_prediction_period")))
+    feature_df = pl.concat(frames, how="diagonal_relaxed")
+    sort_cols = _sort_columns_for(feature_df)
+    if sort_cols:
+        feature_df = feature_df.sort(sort_cols)
+    return_columns = _return_columns_for(feature_df)
+    feature_df = _with_safe_return_lags(feature_df, return_columns)
+    return _sanitize_prediction_returns(feature_df, return_columns)
+
+
+def _write_hidden_feature_data(hidden_df: pl.DataFrame, feature_path: Path) -> dict[str, Any]:
+    feature_path.parent.mkdir(parents=True, exist_ok=True)
+    feature_df = _hidden_feature_frame(hidden_df)
+    feature_df.write_parquet(feature_path)
+    metadata = {
+        "feature_path": str(feature_path),
+        "return_mode": os.environ.get("QR_EVAL_HIDDEN_RETURN_MODE", "null"),
+        "safe_return_lags": list(SAFE_RETURN_LAGS),
+        "source_rows": hidden_df.height,
+        "feature_rows": feature_df.height,
+        "source_columns": hidden_df.columns,
+        "feature_columns": feature_df.columns,
+    }
+    print(
+        "[evaluate] Wrote hidden feature view "
+        f"({metadata['return_mode']} returns): {feature_path}"
+    )
+    return metadata
+
+
+def _write_final_eval_feature_data(
+    train_df: pl.DataFrame | None,
+    hidden_df: pl.DataFrame,
+    feature_path: Path,
+) -> dict[str, Any]:
+    feature_path.parent.mkdir(parents=True, exist_ok=True)
+    feature_df = _final_eval_feature_frame(train_df, hidden_df)
+    feature_df.write_parquet(feature_path)
+    metadata = {
+        "feature_path": str(feature_path),
+        "return_mode": os.environ.get("QR_EVAL_HIDDEN_RETURN_MODE", "null"),
+        "safe_return_lags": list(SAFE_RETURN_LAGS),
+        "train_rows": 0 if train_df is None else train_df.height,
+        "hidden_rows": hidden_df.height,
+        "feature_rows": feature_df.height,
+        "prediction_rows": feature_df.filter(pl.col("is_prediction_period")).height,
+        "return_columns": _return_columns_for(feature_df),
+        "feature_columns": feature_df.columns,
+    }
+    print(
+        "[evaluate] Wrote final eval feature view "
+        f"({metadata['return_mode']} hidden returns): {feature_path}"
+    )
+    return metadata
+
+
+def _filter_signal_period(
+    signal_df: pl.DataFrame,
+    feature_df: pl.DataFrame,
+    *,
+    prediction: bool,
+) -> pl.DataFrame:
+    keys = feature_df.select(["timestamp_agg", "ticker", "is_prediction_period"])
+    joined = signal_df.join(keys, on=["timestamp_agg", "ticker"], how="inner")
+    return (
+        joined.filter(pl.col("is_prediction_period") == prediction)
+        .drop("is_prediction_period")
+    )
+
+
+def _save_debug_parquets(
+    debug_dir: Path,
+    backtest_results: pl.DataFrame | None,
+    joined_df: pl.DataFrame | None,
+    include_joined_returns: bool = True,
+    joined_filename: str = "joined_signal_returns.parquet",
+    daily_filename: str = "daily_pnl.parquet",
+    verbose: bool = True,
+) -> None:
+    """Save diagnostic parquet files when DEBUG_MODE is enabled."""
+    debug_dir.mkdir(parents=True, exist_ok=True)
+
+    # Daily PnL series
+    if backtest_results is not None and "net_ret" in backtest_results.columns:
+        daily_pnl = (
+            backtest_results.with_columns(pl.col("timestamp_agg").dt.date().alias("date"))
+            .group_by("date")
+            .agg(pl.col("net_ret").sum().alias("daily_ret"))
+            .sort("date")
+        )
+        daily_path = debug_dir / daily_filename
+        daily_pnl.write_parquet(str(daily_path))
+        if verbose:
+            print(f"[debug] Saved daily PnL: {daily_path}")
+
+    # Joined data used for scoring
+    if include_joined_returns and joined_df is not None:
+        joined_df.write_parquet(str(debug_dir / joined_filename))
+        if verbose:
+            print(f"[debug] Saved {joined_filename}: {debug_dir / joined_filename}")
+    elif verbose:
+        print(f"[debug] Skipped {joined_filename} export")
+
+
+def _preprocess_signal(signal_df: pl.DataFrame) -> pl.DataFrame:
+    """Cross-sectionally z-score signals and clip at ±4 standard deviations."""
+    return signal_df.with_columns(
+        (
+            (pl.col("signal") - pl.col("signal").mean().over("timestamp_agg"))
+            / pl.col("signal").std().over("timestamp_agg").clip(lower_bound=EPS)
+        )
+        .clip(-4.0, 4.0)
+        .fill_nan(0.0)
+        .alias("signal")
+    )
+
+
+@dataclass
+class SignalMetrics:
+    """Signal evaluation metrics."""
+
+    mean_ic: float
+    ic_std: float
+    ic_positive_pct: float
+    ic_tstat_dk: float
+    signal_return_sharpe: float
+    autocorrelation: float
+    long_short_spread: float
+    monotonicity: float
+    n_timestamps: int
+    n_symbols_mean: float
+    coverage_pct: float
+    ic_decay: dict[str, float]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "mean_ic": self.mean_ic,
+            "ic_std": self.ic_std,
+            "ic_positive_pct": self.ic_positive_pct,
+            "ic_tstat_dk": self.ic_tstat_dk,
+            "signal_return_sharpe": self.signal_return_sharpe,
+            "autocorrelation": self.autocorrelation,
+            "long_short_spread": self.long_short_spread,
+            "monotonicity": self.monotonicity,
+            "n_timestamps": self.n_timestamps,
+            "n_symbols_mean": self.n_symbols_mean,
+            "coverage_pct": self.coverage_pct,
+            "ic_decay": self.ic_decay,
+        }
+
+
+# =============================================================================
+# Core IC + MetricsComputation
+# =============================================================================
+
+
+def compute_ic_per_timestamp(
+    signal_df: pl.DataFrame,
+    test_df: pl.DataFrame,
+    joined_df: pl.DataFrame | None = None,
+) -> pl.DataFrame:
+    """
+    Compute IC at each timestamp as mean(signal * return_next).
+    With z-scored signals, this is proportional to Pearson correlation.
+
+    Args:
+        signal_df: Agent's signal (timestamp_agg, ticker, signal)
+        test_df: Test data with returns (timestamp_agg, ticker, return)
+        joined_df: Optional pre-joined dataframe with return_next column
+
+    Returns:
+        DataFrame with (timestamp_agg, ic) for each timestamp
+    """
+    test_df = test_df.with_columns(pl.col("timestamp_agg").cast(pl.Datetime(time_unit="ms")))
+    signal_df = signal_df.with_columns(pl.col("timestamp_agg").cast(pl.Datetime(time_unit="ms")))
+
+    if joined_df is not None and "return_next" in joined_df.columns:
+        joined = joined_df
+    else:
+        test_with_future = test_df.sort(["ticker", "timestamp_agg"]).with_columns(
+            pl.col(RETURN_COLUMN_NAME).shift(-1).over("ticker").alias("return_next")
+        )
+        joined = signal_df.join(
+            test_with_future.select(["timestamp_agg", "ticker", "return_next"]),
+            on=["timestamp_agg", "ticker"],
+            how="inner",
+        )
+
+    # Filter valid rows
+    joined = joined.filter(
+        pl.col("signal").is_not_null()
+        & pl.col("signal").is_not_nan()
+        & pl.col("signal").is_finite()
+        & pl.col("return_next").is_not_null()
+        & pl.col("return_next").is_not_nan()
+        & pl.col("return_next").is_finite()
+    )
+
+    if len(joined) == 0:
+        return pl.DataFrame({"timestamp_agg": [], "ic": []})
+
+    # IC = mean(signal * return_next) per timestamp
+    # With z-scored signals this is proportional to Pearson correlation
+    ic_df = (
+        joined.group_by("timestamp_agg")
+        .agg((pl.col("signal") * pl.col("return_next")).mean().alias("ic"))
+        .filter(pl.col("ic").is_not_null() & ~pl.col("ic").is_nan())
+        .sort("timestamp_agg")
+    )
+
+    return ic_df
+
+
+def compute_return_correlation(
+    signal_df: pl.DataFrame,
+    test_df: pl.DataFrame,
+    joined_df: pl.DataFrame | None = None,
+) -> float:
+    """
+    Compute correlation between signal and raw returns.
+
+    High correlation (>0.9) suggests the agent is directly using returns.
+    """
+    if joined_df is not None:
+        joined = joined_df
+    else:
+        joined = signal_df.join(
+            test_df.select(["timestamp_agg", "ticker", RETURN_COLUMN_NAME]),
+            on=["timestamp_agg", "ticker"],
+            how="inner",
+        )
+
+    joined = joined.filter(
+        pl.col("signal").is_not_null()
+        & pl.col("signal").is_not_nan()
+        & pl.col(RETURN_COLUMN_NAME).is_not_null()
+        & pl.col(RETURN_COLUMN_NAME).is_not_nan()
+    )
+
+    if len(joined) < 10:
+        return 0.0
+
+    # Use Polars native correlation
+    corr = joined.select(pl.corr("signal", RETURN_COLUMN_NAME)).item()
+    return float(corr) if corr is not None and not np.isnan(corr) else 0.0
+
+
+def compute_dk_tstat(
+    signal_df: pl.DataFrame,
+    test_df: pl.DataFrame,
+    max_lag: int | None = None,
+) -> float:
+    """
+    Compute Driscoll-Kraay t-statistic for signal predictive power.
+
+    Runs panel regression: return_{i,t+1} = β * signal_{i,t} + α + ε_{i,t}
+    with Driscoll-Kraay standard errors (cluster-robust for panel data).
+
+    Args:
+        signal_df: DataFrame with (timestamp_agg, ticker, signal)
+        test_df: DataFrame with (timestamp_agg, ticker, return)
+        max_lag: Maximum lag for HAC kernel (default: n^(1/3))
+
+    Returns:
+        t-statistic for β (signal coefficient)
+    """
+    from statsmodels.regression.linear_model import OLS
+    from statsmodels.tools.tools import add_constant
+
+    # Join signal with next-period returns
+    test_with_future = test_df.sort(["ticker", "timestamp_agg"]).with_columns(
+        pl.col(RETURN_COLUMN_NAME).shift(-1).over("ticker").alias("return_next")
+    )
+
+    joined = signal_df.join(
+        test_with_future.select(["timestamp_agg", "ticker", "return_next"]),
+        on=["timestamp_agg", "ticker"],
+        how="inner",
+    ).filter(
+        pl.col("signal").is_not_null()
+        & pl.col("signal").is_not_nan()
+        & pl.col("signal").is_finite()
+        & pl.col("return_next").is_not_null()
+        & pl.col("return_next").is_not_nan()
+    )
+
+    if len(joined) < 100:
+        return 0.0
+
+    # Need to convert timestamps to integer indices for statsmodels
+    # Sort by time and create a time index
+    joined = joined.sort("timestamp_agg")
+    unique_times = joined["timestamp_agg"].unique().sort()
+    time_to_idx = {t: i for i, t in enumerate(unique_times.to_list())}
+    time_indices = joined["timestamp_agg"].replace_strict(time_to_idx).cast(pl.Int64).to_numpy()
+
+    # Extract arrays for regression
+    y = joined["return_next"].to_numpy()
+    X = add_constant(joined["signal"].to_numpy())
+
+    n_times = len(unique_times)
+    if max_lag is None:
+        max_lag = int(np.ceil(n_times ** (1 / 3)))
+
+    # Run OLS with Driscoll-Kraay standard errors (hac-groupsum)
+    # This clusters by time period first, then applies HAC to the
+    # time series of cross-sectional moment averages
+    try:
+        model = OLS(y, X).fit(
+            cov_type="hac-groupsum",
+            cov_kwds={
+                "time": time_indices,
+                "maxlags": max_lag,
+            },
+        )
+
+        print(model.summary())
+        # Return t-stat for the signal coefficient (index 1, after constant)
+        return float(model.tvalues[1])
+    except Exception as e:
+        print(f"[compute_dk_tstat] Error: {e}")
+        return 0.0
+
+
+def run_backtest_with_alphalib(
+    signal_df: pl.DataFrame,
+    test_df: pl.DataFrame,
+) -> tuple[pl.DataFrame | None, dict, list, list[str]]:
+    """
+    Run backtest using alphalib's Backtester.
+
+    Converts agent's signal to normalized weights and runs proper backtest
+    with transaction costs and funding rate adjustments.
+
+    Returns:
+        Tuple of (results_df, metrics_dict, timestamps, symbols)
+    """
+    # Join signal with test data
+    # Only select columns that exist in test_df
+    select_cols = ["timestamp_agg", "ticker", RETURN_COLUMN_NAME]
+    if "funding_rate" in test_df.columns:
+        select_cols.append("funding_rate")
+    joined = signal_df.join(
+        test_df.select(select_cols),
+        on=["timestamp_agg", "ticker"],
+        how="inner",
+    ).filter(
+        pl.col("signal").is_not_null()
+        & pl.col("signal").is_not_nan()
+        & pl.col("signal").is_finite()
+    )
+
+    if len(joined) == 0:
+        return None, {}, [], []
+
+    timestamps = joined["timestamp_agg"].unique().sort().to_list()
+    symbols = joined["ticker"].unique().sort().to_list()
+
+    if not timestamps or not symbols:
+        return None, {}, [], []
+
+    # Use raw signal directly as weights (agents must output z-scores)
+    joined = joined.with_columns(
+        [pl.col("signal").fill_nan(0.0).fill_null(0.0).alias("weight")]
+    )
+
+    # Convert to WideMatrix format for alphalib
+    try:
+        weights_wide = WideMatrix.from_long(
+            joined,
+            timestamp_col="timestamp_agg",
+            symbol_col="ticker",
+            value_col="weight",
+            fill_null=0.0,
+        )
+
+        returns_wide = WideMatrix.from_long(
+            joined,
+            timestamp_col="timestamp_agg",
+            symbol_col="ticker",
+            value_col=RETURN_COLUMN_NAME,
+            fill_null=0.0,
+        )
+
+        # Run backtest with alphalib
+        config = BacktestConfig(
+            max_gross=2.0,
+            cost_model="none",  # No transaction costs for signal eval
+            periodicity="1h",
+        )
+        backtester = Backtester(config)
+        results_df, metrics = backtester.run(weights_wide, returns_wide)
+
+        # Extract metrics as dict
+        metrics_dict = {
+            "sharpe_net": float(metrics.sharpe_net) if metrics.sharpe_net else 0.0,
+            "sharpe_gross": float(metrics.sharpe_gross) if metrics.sharpe_gross else 0.0,
+            "max_drawdown": float(metrics.max_drawdown) if metrics.max_drawdown else 0.0,
+            "cagr": float(metrics.cagr) if metrics.cagr else 0.0,
+            "turnover_ann": float(metrics.turnover_ann) if metrics.turnover_ann else 0.0,
+        }
+
+        return results_df, metrics_dict, timestamps, symbols
+
+    except Exception as e:
+        print(f"[backtest] Error running alphalib backtest: {e}")
+        import traceback
+
+        traceback.print_exc()
+        return None, {}, timestamps, symbols
+
+
+def compute_daily_sharpe(
+    backtest_results: pl.DataFrame | None,
+    timestamp_col: str = "timestamp_agg",
+    ann_factor: int = 365,  # Crypto trades 365 days/year
+) -> float:
+    """
+    Compute Sharpe ratio from daily-aggregated returns.
+
+    Args:
+        backtest_results: DataFrame with timestamp and net_ret columns (hourly)
+        timestamp_col: Name of timestamp column
+        ann_factor: Annualization factor (365 for crypto, 252 for stocks)
+
+    Returns:
+        Annualized Sharpe ratio based on daily returns
+    """
+    if backtest_results is None or len(backtest_results) == 0:
+        return 0.0
+
+    if "net_ret" not in backtest_results.columns:
+        return 0.0
+
+    # Aggregate hourly returns to daily by summing
+    daily_returns = (
+        backtest_results.with_columns(pl.col(timestamp_col).dt.date().alias("date"))
+        .group_by("date")
+        .agg(pl.col("net_ret").sum().alias("daily_ret"))
+        .sort("date")
+    )
+
+    n_days = len(daily_returns)
+    if n_days < 2:
+        return 0.0
+
+    daily_ret = daily_returns["daily_ret"].to_numpy()
+    mean_ret = float(np.mean(daily_ret))
+    std_ret = float(np.std(daily_ret, ddof=1))
+
+    if std_ret == 0 or np.isnan(std_ret):
+        return 0.0
+
+    daily_sharpe = mean_ret / std_ret
+    annualized_sharpe = daily_sharpe * np.sqrt(ann_factor)
+
+    return annualized_sharpe
+
+
+def compute_signal_return_sharpe(
+    signal_df: pl.DataFrame,
+    test_df: pl.DataFrame,
+) -> tuple[float, dict]:
+    """
+    Compute signal return Sharpe using alphalib backtest.
+
+    Returns:
+        Tuple of (sharpe_ratio, full_metrics_dict)
+    """
+    results_df, metrics, _, _ = run_backtest_with_alphalib(signal_df, test_df)
+
+    if not metrics:
+        return 0.0, {}
+
+    # Use daily-aggregated Sharpe instead of hourly
+    daily_sharpe = compute_daily_sharpe(results_df)
+    metrics["sharpe_daily"] = daily_sharpe
+
+    return daily_sharpe, metrics
+
+
+def compute_autocorrelation(signal_df: pl.DataFrame) -> float:
+    """Compute lag-1 autocorrelation of signal."""
+    lagged = (
+        signal_df.sort(["ticker", "timestamp_agg"])
+        .with_columns(pl.col("signal").shift(1).over("ticker").alias("signal_lag"))
+        .drop_nulls()
+    )
+
+    if len(lagged) == 0:
+        return 0.0
+
+    autocorr = lagged.select(pl.corr("signal", "signal_lag")).item()
+    return float(autocorr) if autocorr is not None and not np.isnan(autocorr) else 0.0
+
+
+def compute_quantile_metrics(
+    signal_df: pl.DataFrame,
+    test_df: pl.DataFrame,
+    n_quantiles: int = 5,
+    joined_df: pl.DataFrame | None = None,
+) -> dict[str, float]:
+    """Compute long/short spread and monotonicity using next-period returns."""
+    # Use pre-joined df if available (should have return_next already)
+    if joined_df is not None and "return_next" in joined_df.columns:
+        joined = joined_df.filter(
+            pl.col("signal").is_not_null() & pl.col("return_next").is_not_null()
+        )
+    else:
+        # Compute next-period returns
+        test_with_future = test_df.sort(["ticker", "timestamp_agg"]).with_columns(
+            pl.col(RETURN_COLUMN_NAME).shift(-1).over("ticker").alias("return_next")
+        )
+
+        if joined_df is not None:
+            joined = joined_df.join(
+                test_with_future.select(["timestamp_agg", "ticker", "return_next"]),
+                on=["timestamp_agg", "ticker"],
+                how="inner",
+            ).filter(pl.col("signal").is_not_null() & pl.col("return_next").is_not_null())
+        else:
+            joined = signal_df.join(
+                test_with_future.select(["timestamp_agg", "ticker", "return_next"]),
+                on=["timestamp_agg", "ticker"],
+                how="inner",
+            ).filter(pl.col("signal").is_not_null() & pl.col("return_next").is_not_null())
+
+    if len(joined) < 100:
+        return {"long_short_spread": 0.0, "monotonicity": 0.0}
+
+    # Assign quantile buckets per timestamp
+    try:
+        bucketed = joined.with_columns(
+            pl.col("signal")
+            .qcut(
+                n_quantiles,
+                labels=[str(i) for i in range(n_quantiles)],
+                allow_duplicates=True,
+            )
+            .cast(pl.Int32)
+            .over("timestamp_agg")
+            .alias("bucket")
+        )
+    except Exception:
+        return {"long_short_spread": 0.0, "monotonicity": 0.0}
+
+    # Mean return per bucket (using next-period return)
+    bucket_stats = (
+        bucketed.group_by("bucket")
+        .agg(pl.col("return_next").mean().alias("avg_return"))
+        .sort("bucket")
+        .drop_nulls()
+    )
+
+    if len(bucket_stats) < 2:
+        return {"long_short_spread": 0.0, "monotonicity": 0.0}
+
+    # Spread: top bucket - bottom bucket
+    try:
+        top_ret = bucket_stats.filter(pl.col("bucket") == n_quantiles - 1)["avg_return"].item()
+        bot_ret = bucket_stats.filter(pl.col("bucket") == 0)["avg_return"].item()
+        spread = top_ret - bot_ret
+    except Exception:
+        spread = 0.0
+
+    # Monotonicity: Spearman correlation of bucket vs avg_return
+    try:
+        monotonicity = bucket_stats.select(
+            pl.corr("bucket", "avg_return", method="spearman")
+        ).item()
+    except Exception:
+        monotonicity = 0.0
+
+    return {
+        "long_short_spread": float(spread) if spread is not None else 0.0,
+        "monotonicity": float(monotonicity)
+        if monotonicity is not None and not np.isnan(monotonicity)
+        else 0.0,
+    }
+
+
+def compute_ic_decay(
+    signal_df: pl.DataFrame,
+    test_df: pl.DataFrame,
+    horizons: list[int] | None = None,
+    joined_df: pl.DataFrame | None = None,
+) -> dict[str, float]:
+    """Compute IC at multiple forward horizons.
+
+    Optimized to compute all shifted returns in a single pass.
+    """
+    if horizons is None:
+        horizons = [1, 2, 4, 8, 24]
+
+    # Compute all shifted returns in one pass
+    test_sorted = test_df.sort(["ticker", "timestamp_agg"])
+    shift_cols = [
+        pl.col(RETURN_COLUMN_NAME).shift(-h).over("ticker").alias(f"ret_{h}") for h in horizons
+    ]
+    test_with_shifts = test_sorted.with_columns(shift_cols)
+
+    # Join once with all shifted columns
+    if joined_df is not None:
+        # Add shift columns to existing join
+        joined = joined_df.join(
+            test_with_shifts.select(["timestamp_agg", "ticker"] + [f"ret_{h}" for h in horizons]),
+            on=["timestamp_agg", "ticker"],
+            how="inner",
+        )
+    else:
+        joined = signal_df.join(
+            test_with_shifts.select(["timestamp_agg", "ticker"] + [f"ret_{h}" for h in horizons]),
+            on=["timestamp_agg", "ticker"],
+            how="inner",
+        )
+
+    # Filter for valid signals
+    joined = joined.filter(pl.col("signal").is_not_null())
+
+    results = {}
+    for h in horizons:
+        ret_col = f"ret_{h}"
+        valid_joined = joined.filter(pl.col(ret_col).is_not_null())
+
+        if len(valid_joined) < 100:
+            results[f"T+{h}"] = 0.0
+            continue
+
+        try:
+            # Use dot product mean (consistent with main IC calculation)
+            ic_df = (
+                valid_joined.group_by("timestamp_agg")
+                .agg((pl.col("signal") * pl.col(ret_col)).mean().alias("ic"))
+                .filter(pl.col("ic").is_not_null() & ~pl.col("ic").is_nan())
+            )
+
+            mean_ic = ic_df["ic"].mean() if len(ic_df) > 0 else 0.0
+            results[f"T+{h}"] = float(mean_ic) if mean_ic is not None else 0.0
+        except Exception:
+            results[f"T+{h}"] = 0.0
+
+    return results
+
+
+# =============================================================================
+# Plot Generation
+# =============================================================================
+
+
+def _plot_ic_over_time(
+    ic_df: pl.DataFrame,
+    rolling_window: int = 168,  # 7 days of 15m bars
+):
+    """Plot IC time series with rolling mean and return the figure."""
+    timestamps = ic_df["timestamp_agg"].to_list()
+    ic_values = ic_df["ic"].to_list()
+
+    if len(timestamps) == 0:
+        # Return empty figure
+        fig, _ = plt.subplots(figsize=(12, 6))
+        return fig
+
+    # Rolling mean
+    rolling_ic = (
+        pl.Series(ic_values).rolling_mean(window_size=rolling_window, min_samples=1).to_list()
+    )
+
+    # Trim warmup period for cleaner plot
+    plot_start = min(rolling_window, len(timestamps) // 4)
+    if len(timestamps) > plot_start:
+        plot_timestamps = timestamps[plot_start:]
+        plot_rolling = rolling_ic[plot_start:]
+    else:
+        plot_timestamps = timestamps
+        plot_rolling = rolling_ic
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.plot(
+        plot_timestamps,
+        plot_rolling,
+        linewidth=1.5,
+        color="darkblue",
+        label=f"Rolling {rolling_window}",
+    )
+    ax.axhline(y=0, color="gray", linestyle="--", linewidth=0.5)
+
+    mean_ic = np.mean(ic_values)
+    ax.set_title(f"Information Coefficient (IC) | Mean: {mean_ic:.4f}")
+    ax.set_ylabel("IC")
+    ax.set_xlabel("Date")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.autofmt_xdate()
+
+    return fig
+
+
+def plot_ic_over_time(
+    ic_df: pl.DataFrame,
+    save_path: str,
+    rolling_window: int = 168,  # 7 days of 15m bars
+) -> str:
+    """Plot IC time series with rolling mean and save to file."""
+    fig = _plot_ic_over_time(ic_df, rolling_window)
+    Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return save_path
+
+
+def _plot_ic_decay(
+    ic_decay: dict[str, float],
+):
+    """Plot IC term structure (decay) and return the figure."""
+    horizons = list(ic_decay.keys())
+    values = list(ic_decay.values())
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(horizons, values, marker="o", linestyle="-", color="purple", linewidth=2, markersize=8)
+    ax.axhline(0, color="gray", linestyle="--", linewidth=0.5)
+
+    ax.set_title("Alpha Decay (IC Term Structure)")
+    ax.set_xlabel("Horizon")
+    ax.set_ylabel("IC")
+    ax.grid(True, alpha=0.3)
+
+    return fig
+
+
+def plot_ic_decay(ic_decay: dict[str, float], save_path: str) -> str:
+    """Plot IC term structure (decay) and save to file."""
+    fig = _plot_ic_decay(ic_decay)
+    Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return save_path
+
+
+def _plot_equity_curve(
+    backtest_results: pl.DataFrame | None,
+    signal_name: str = "signal",
+    sharpe: float = 0.0,
+    max_drawdown: float = 0.0,
+):
+    """Plot equity curve with drawdown subplot using daily-aggregated returns.
+
+    Uses the same daily return aggregation as compute_daily_sharpe() so
+    the plotted equity curve is consistent with the reported Sharpe ratio.
+    """
+    if backtest_results is None or len(backtest_results) == 0:
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+        return fig
+
+    # Aggregate hourly returns to daily (same as compute_daily_sharpe)
+    daily = (
+        backtest_results.with_columns(pl.col("timestamp_agg").dt.date().alias("date"))
+        .group_by("date")
+        .agg(pl.col("net_ret").sum().alias("daily_ret"))
+        .sort("date")
+    )
+
+    dates = daily["date"].to_list()
+    daily_ret = daily["daily_ret"].to_numpy()
+
+    # Build equity curve from daily returns
+    equity = np.cumprod(1.0 + daily_ret)
+
+    # Compute drawdown from equity curve
+    running_max = np.maximum.accumulate(equity)
+    drawdown = (equity - running_max) / (running_max + EPS)
+
+    # Create figure
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+
+    # Equity curve
+    ax1.plot(dates, equity, linewidth=1.5, color="darkblue")
+    ax1.axhline(y=1.0, color="gray", linestyle="--", linewidth=0.5)
+    ax1.set_ylabel("Equity (normalized)")
+    ax1.set_title(f"Signal Equity Curve (daily): {signal_name}")
+    ax1.grid(True, alpha=0.3)
+
+    # Annotations
+    total_return = (equity[-1] - 1) * 100
+    max_dd_pct = max_drawdown * 100
+    ax1.annotate(
+        f"Return: {total_return:.1f}%\nSharpe: {sharpe:.2f}\nMax DD: {max_dd_pct:.1f}%",
+        xy=(0.02, 0.98),
+        xycoords="axes fraction",
+        fontsize=10,
+        verticalalignment="top",
+        bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
+    )
+
+    # Drawdown subplot
+    ax2.fill_between(dates, drawdown * 100, 0, alpha=0.3, color="red")
+    ax2.plot(dates, drawdown * 100, linewidth=1, color="darkred")
+    ax2.set_ylabel("Drawdown (%)")
+    ax2.set_xlabel("Date")
+    ax2.grid(True, alpha=0.3)
+
+    fig.autofmt_xdate()
+    plt.tight_layout()
+
+    return fig
+
+
+def plot_equity_curve(
+    backtest_results: pl.DataFrame | None,
+    save_path: str,
+    signal_name: str = "signal",
+    sharpe: float = 0.0,
+    max_drawdown: float = 0.0,
+) -> str:
+    """Plot equity curve with drawdown subplot using daily-aggregated returns and save to file."""
+    fig = _plot_equity_curve(backtest_results, signal_name, sharpe, max_drawdown)
+    Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return save_path
+
+
+def compute_calibration_curve(
+    signal_df: pl.DataFrame,
+    test_df: pl.DataFrame,
+    n_buckets: int = 10,
+    joined_df: pl.DataFrame | None = None,
+) -> dict[str, list[float]]:
+    """
+    Compute calibration curve: average next-period return per signal quantile bucket.
+
+    Returns dict with 'bucket_centers' and 'avg_returns' for plotting.
+    """
+    # Use pre-joined df if available (should have return_next already)
+    if joined_df is not None and "return_next" in joined_df.columns:
+        joined = joined_df
+    else:
+        # Compute next-period returns
+        test_with_future = test_df.sort(["ticker", "timestamp_agg"]).with_columns(
+            pl.col(RETURN_COLUMN_NAME).shift(-1).over("ticker").alias("return_next")
+        )
+
+        if joined_df is not None:
+            joined = joined_df.join(
+                test_with_future.select(["timestamp_agg", "ticker", "return_next"]),
+                on=["timestamp_agg", "ticker"],
+                how="inner",
+            )
+        else:
+            joined = signal_df.join(
+                test_with_future.select(["timestamp_agg", "ticker", "return_next"]),
+                on=["timestamp_agg", "ticker"],
+                how="inner",
+            )
+
+    joined = joined.filter(
+        pl.col("signal").is_not_null()
+        & pl.col("signal").is_not_nan()
+        & pl.col("signal").is_finite()
+        & pl.col("return_next").is_not_null()
+        & pl.col("return_next").is_not_nan()
+    )
+
+    if len(joined) < 100:
+        return {"bucket_centers": [], "avg_returns": [], "bucket_counts": []}
+
+    # Assign quantile buckets cross-sectionally per timestamp
+    try:
+        bucketed = joined.with_columns(
+            pl.col("signal")
+            .qcut(
+                n_buckets,
+                labels=[str(i) for i in range(n_buckets)],
+                allow_duplicates=True,
+            )
+            .cast(pl.Int32)
+            .over("timestamp_agg")
+            .alias("bucket")
+        )
+    except Exception:
+        return {"bucket_centers": [], "avg_returns": [], "bucket_counts": []}
+
+    # Compute mean next-period return and count per bucket
+    bucket_stats = (
+        bucketed.group_by("bucket")
+        .agg(
+            [
+                pl.col("return_next").mean().alias("avg_return"),
+                pl.col("return_next").count().alias("count"),
+            ]
+        )
+        .sort("bucket")
+        .drop_nulls()
+    )
+
+    if len(bucket_stats) < 2:
+        return {"bucket_centers": [], "avg_returns": [], "bucket_counts": []}
+
+    # Convert to lists for plotting
+    buckets = bucket_stats["bucket"].to_list()
+    avg_returns = bucket_stats["avg_return"].to_list()
+    counts = bucket_stats["count"].to_list()
+
+    # Convert bucket indices to percentile centers (e.g., bucket 0 -> 5%, bucket 9 -> 95% for n=10)
+    bucket_centers = [(b + 0.5) / n_buckets * 100 for b in buckets]
+
+    return {
+        "bucket_centers": bucket_centers,
+        "avg_returns": avg_returns,
+        "bucket_counts": counts,
+    }
+
+
+def _plot_calibration_curve(
+    calibration_data: dict[str, list[float]],
+    n_buckets: int = 10,
+):
+    """Plot calibration curve: signal quantile vs average forward return."""
+    bucket_centers = calibration_data.get("bucket_centers", [])
+    avg_returns = calibration_data.get("avg_returns", [])
+    bucket_counts = calibration_data.get("bucket_counts", [])
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    if len(bucket_centers) == 0:
+        ax.text(
+            0.5,
+            0.5,
+            "Insufficient data for calibration curve",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+        )
+        return fig
+
+    # Convert returns to basis points for readability
+    avg_returns_bps = [r * 10000 for r in avg_returns]
+
+    # Bar plot with color gradient
+    colors = plt.cm.RdYlGn(np.linspace(0.1, 0.9, len(bucket_centers)))
+    bars = ax.bar(bucket_centers, avg_returns_bps, width=100 / n_buckets * 0.8, color=colors)
+
+    # Add trend line
+    if len(bucket_centers) >= 3:
+        z = np.polyfit(bucket_centers, avg_returns_bps, 1)
+        p = np.poly1d(z)
+        x_line = np.linspace(min(bucket_centers), max(bucket_centers), 100)
+        ax.plot(x_line, p(x_line), "k--", linewidth=2, alpha=0.7, label="Linear fit")
+
+    ax.axhline(0, color="gray", linestyle="-", linewidth=0.5)
+
+    # Compute monotonicity for annotation
+    if len(avg_returns) >= 2:
+        monotonicity, _ = stats.spearmanr(range(len(avg_returns)), avg_returns)
+        monotonicity = float(monotonicity) if not np.isnan(monotonicity) else 0.0
+    else:
+        monotonicity = 0.0
+
+    # Spread in bps
+    if len(avg_returns) >= 2:
+        spread_bps = (avg_returns[-1] - avg_returns[0]) * 10000
+    else:
+        spread_bps = 0.0
+
+    ax.set_title(
+        f"Signal Calibration Curve | Monotonicity: {monotonicity:.2f} | Spread: {spread_bps:.1f} bps"
+    )
+    ax.set_xlabel("Signal Percentile")
+    ax.set_ylabel("Average Forward Return (bps)")
+    ax.set_xlim(0, 100)
+    ax.legend()
+    ax.grid(True, alpha=0.3, axis="y")
+
+    # Add count annotations on bars
+    for bar, count in zip(bars, bucket_counts, strict=True):
+        height = bar.get_height()
+        ax.annotate(
+            f"{count:,}",
+            xy=(bar.get_x() + bar.get_width() / 2, height),
+            xytext=(0, 3 if height >= 0 else -10),
+            textcoords="offset points",
+            ha="center",
+            va="bottom" if height >= 0 else "top",
+            fontsize=8,
+            alpha=0.7,
+        )
+
+    plt.tight_layout()
+    return fig
+
+
+def plot_calibration_curve(
+    signal_df: pl.DataFrame,
+    test_df: pl.DataFrame,
+    save_path: str,
+    n_buckets: int = 10,
+) -> tuple[str, dict]:
+    """Compute and plot calibration curve, save to file."""
+    calibration_data = compute_calibration_curve(signal_df, test_df, n_buckets)
+    fig = _plot_calibration_curve(calibration_data, n_buckets)
+    Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return save_path, calibration_data
+
+
+# =============================================================================
+# LLM Judge Integration
+# =============================================================================
+
+JUDGE_PROMPT = """\
+You are a qualitative auditor for a trading signal generation stage in a mid-frequency statistical arbitrage benchmark.
+
+Your job is to assess whether the submitted solution is qualitatively valid. The deterministic verifier owns quantitative scoring.
+Do not invalidate a solution merely because it has low IC, low Sharpe, poor OOS performance, weak monotonicity, bad drawdown, or a low checker score.
+Those are quantitative outcomes that should remain in the metrics table.
+
+Only mark the submission invalid for qualitative/protocol problems such as:
+- Direct or indirect hidden/test/validation data access.
+- Look-ahead leakage or same-row/future return usage in prediction-period features.
+- Hard-coding, faking outputs, path probing, or depending on hidden artifact names.
+- Code that fails to generate a meaningful signal because of implementation mechanics: empty output, almost all null/NaN, constant/tied output, one/few valid timestamps caused by code behavior, row-order bugs after joins, or severe null propagation.
+- Implausibly good metrics when they are best explained by leakage or another code/protocol defect.
+
+Use metrics and plots only as context for those qualitative questions. For example:
+- Low IC or negative Sharpe alone => usually `valid` or `warn`, not `invalid`.
+- A flat/constant signal, one valid timestamp, or metrics that are non-finite because the code produced broken output => `invalid`.
+- Implausibly high Sharpe with evidence of same-row returns, future labels, hidden data access, or impossible smoothness => `invalid`.
+- Suspicious but unproven fragility, overfitting, or too-short evaluation support => `warn`.
+
+## Signal Code
+```python
+{code}
+```
+
+## Metrics
+{metrics_formatted}
+
+## Qualitative Audit Criteria
+
+### 1. Protocol and leakage
+- No direct access to `/tests`, `test.parquet`, `val.parquet`, hidden files, or hidden artifact paths.
+- No same-row or future return labels used as deployable prediction features.
+- No hard-coded hidden dates, symbols, answers, or benchmark-specific shortcuts.
+
+### 2. Signal generation validity
+- Produces a numeric signal for a meaningful number of prediction rows.
+- Avoids implementation bugs that destroy the intended time ordering or signal values.
+- Handles nulls/division-by-zero without collapsing to a constant, all-zero, all-null, or one-timestamp output.
+
+### 3. Implausibility as a qualitative warning
+- Treat implausibly high metrics as evidence to investigate leakage or broken evaluation support.
+- Do not call high metrics invalid unless you can point to a qualitative mechanism or strong visual/code evidence.
+
+## Visual Analysis
+Analyze the attached plots:
+1. IC over time and decay: Use only to spot suspicious instability, leakage-like perfection, or broken outputs.
+2. Equity curve: Use only to spot impossible smoothness, one/few-day artifacts, or broken flat output.
+3. Calibration curve: Non-monotonicity is a quantitative weakness, not invalid by itself. It becomes invalid only when it shows a degenerate/tied/constant output or another implementation defect.
+
+Respond with JSON:
+{{
+    "decision": "valid" | "warn" | "invalid",
+    "score": 0.0-1.0,
+    "feedback": "Qualitative audit feedback. Do not summarize quantitative underperformance as invalidity.",
+    "issues": ["issue1", "issue2"],
+    "suggestions": ["suggestion1", "suggestion2"],
+    "implausible": true | false,
+    "implausible_reason": "Explain qualitative/code evidence for implausibility, if any" | null,
+    "quantitative_notes": ["optional notes about weak/strong metrics that are not validity decisions"],
+    "plot_analysis": {{
+        "ic_plot": "Analysis of IC over time plot...",
+        "decay_plot": "Analysis of IC decay plot...",
+        "equity_plot": "Analysis of equity curve...",
+        "calibration_plot": "Analysis of calibration curve..."
+    }}
+}}
+"""
+
+
+async def call_llm_judge(
+    code: str,
+    metrics: dict,
+    plot_paths: list[str],
+) -> dict:
+    """Call Gemini to evaluate the signal with visual analysis."""
+    try:
+        from google import genai
+        from google.genai import types
+    except ImportError:
+        return {
+            "decision": "warn",
+            "score": 0.5,
+            "feedback": "LLM judge unavailable (google-genai not installed)",
+            "issues": [],
+            "suggestions": [],
+        }
+
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        return {
+            "decision": "warn",
+            "score": 0.5,
+            "feedback": "LLM judge unavailable (GEMINI_API_KEY not set)",
+            "issues": [],
+            "suggestions": [],
+        }
+
+    client = genai.Client(api_key=api_key)
+
+    # Format metrics
+    metrics_lines = []
+    for k, v in metrics.items():
+        if k in ["ic_decay", "passed", "error"]:
+            continue
+        if isinstance(v, float):
+            metrics_lines.append(f"- {k}: {v:.4f}")
+        else:
+            metrics_lines.append(f"- {k}: {v}")
+    metrics_formatted = "\n".join(metrics_lines)
+
+    # Build prompt
+    prompt = JUDGE_PROMPT.format(
+        code=code,
+        metrics_formatted=metrics_formatted,
+    )
+
+    # Build content with images
+    contents: list = [prompt]
+    for path in plot_paths:
+        try:
+            image_bytes = Path(path).read_bytes()
+            contents.append(types.Part.from_bytes(data=image_bytes, mime_type="image/png"))
+        except FileNotFoundError:
+            contents.append(f"[Image not found: {path}]")
+
+    try:
+        response = await client.aio.models.generate_content(
+            model="gemini-3-pro-preview",
+            contents=contents,
+            config=types.GenerateContentConfig(response_mime_type="application/json"),
+        )
+        result = json.loads(response.text)
+        return result
+    except Exception as e:
+        return {
+            "decision": "warn",
+            "score": 0.5,
+            "feedback": f"LLM judge error: {e}",
+            "issues": [str(e)],
+            "suggestions": [],
+        }
+
+
+def _normalize_judge_result(judge_result: Any) -> dict[str, Any]:
+    """Coerce model JSON quirks into the judge object shape used by scoring."""
+    if isinstance(judge_result, dict):
+        normalized = dict(judge_result)
+    elif isinstance(judge_result, list):
+        normalized = next((dict(item) for item in judge_result if isinstance(item, dict)), None)
+        if normalized is None:
+            normalized = {
+                "decision": "warn",
+                "score": 0.0,
+                "feedback": "LLM judge returned a list without a JSON object.",
+                "issues": ["Invalid judge response shape"],
+                "suggestions": [],
+            }
+    else:
+        normalized = {
+            "decision": "warn",
+            "score": 0.0,
+            "feedback": f"LLM judge returned invalid response type: {type(judge_result).__name__}",
+            "issues": ["Invalid judge response shape"],
+            "suggestions": [],
+        }
+
+    decision = str(normalized.get("decision") or "warn").strip().lower()
+    decision = {
+        "approve": "valid",
+        "accepted": "valid",
+        "pass": "valid",
+        "passed": "valid",
+        "ok": "valid",
+        "iterate": "warn",
+        "review": "warn",
+        "warning": "warn",
+        "skip": "warn",
+        "reject": "invalid",
+        "fail": "invalid",
+        "failed": "invalid",
+    }.get(decision, decision)
+    if decision not in {"valid", "warn", "invalid"}:
+        decision = "warn"
+    normalized["decision"] = decision
+    normalized.setdefault("score", 0.5)
+    normalized.setdefault("feedback", "")
+    normalized.setdefault("issues", [])
+    normalized.setdefault("suggestions", [])
+    normalized.setdefault("quantitative_notes", [])
+    normalized.setdefault("plot_analysis", {})
+    normalized["qualitative_validity"] = decision
+    normalized["qualitative_invalid"] = decision == "invalid"
+    return normalized
+
+
+# =============================================================================
+# Combined Scoring
+# =============================================================================
+
+
+def check_implausibility(metrics: SignalMetrics) -> tuple[bool, str | None]:
+    """
+    Check if metrics are implausibly good (likely predicting current returns).
+
+    Returns:
+        Tuple of (is_implausible, reason)
+    """
+    reasons = []
+
+    if metrics.signal_return_sharpe >= IMPLAUSIBLE_SHARPE:
+        reasons.append(
+            f"Sharpe of {metrics.signal_return_sharpe:.1f} is implausibly high (>{IMPLAUSIBLE_SHARPE})"
+        )
+
+    if abs(metrics.mean_ic) >= IMPLAUSIBLE_IC:
+        reasons.append(f"IC of {metrics.mean_ic:.3f} is implausibly high (>{IMPLAUSIBLE_IC})")
+
+    if metrics.ic_positive_pct >= IMPLAUSIBLE_IC_POSITIVE_PCT:
+        reasons.append(
+            f"IC positive {metrics.ic_positive_pct:.1%} is implausibly high (>{IMPLAUSIBLE_IC_POSITIVE_PCT:.0%})"
+        )
+
+    if reasons:
+        return True, "; ".join(reasons)
+    return False, None
+
+
+def compute_combined_score(
+    metrics: SignalMetrics,
+    judge_result: dict,
+    metric_weight: float = 1.0,
+    judge_weight: float = 0.0,
+) -> tuple[float, bool]:
+    """
+    Combine metric-based score with LLM judge score.
+
+    Core metrics: t-stat (40%), Sharpe (60%), Autocorrelation (penalty up to -0.4).
+    Thresholds defined at top of file (keep in sync with grading.py).
+
+    Returns:
+        Tuple of (final_score, passed)
+    """
+    tstat = metrics.ic_tstat_dk  # Must be positive — negative means signal is backwards
+    sharpe = metrics.signal_return_sharpe
+    autocorr = metrics.autocorrelation
+
+    # Implausibility check disabled — kept for reference but not used in scoring
+    # auto_implausible, auto_reason = check_implausibility(metrics)
+    # judge_implausible = judge_result.get("implausible", False)
+    # judge_reason = judge_result.get("implausible_reason")
+    # implausible = auto_implausible or judge_implausible
+    # if implausible:
+    #     reasons = []
+    #     if auto_reason:
+    #         reasons.append(f"Auto: {auto_reason}")
+    #     if judge_reason:
+    #         reasons.append(f"Judge: {judge_reason}")
+    #     implausible_reason = " | ".join(reasons)
+    # else:
+    #     implausible_reason = None
+    # if implausible:
+    #     print(f"[scoring] IMPLAUSIBLE RESULT DETECTED: {implausible_reason}")
+    #     return MIN_SCORE_VALID_OUTPUT, False, True, implausible_reason
+
+    # Grade t-stat: 1.0 if >=4, 0.8 if >=3, 0.6 if >=2, 0.2 if >=1, 0.0 below
+    if tstat >= 4.0:
+        tstat_score = 1.0
+    elif tstat >= 3.0:
+        tstat_score = 0.8
+    elif tstat >= 2.0:
+        tstat_score = 0.6
+    elif tstat >= 1.0:
+        tstat_score = 0.2
+    else:
+        tstat_score = 0.0
+
+    # Grade Sharpe: 1.0 if >=2, 0.8 if >=1.5, 0.4 if >=1, 0.2 if >=0.7, 0.0 below
+    if sharpe >= 2.0:
+        sharpe_score = 1.0
+    elif sharpe >= 1.5:
+        sharpe_score = 0.8
+    elif sharpe >= 1.0:
+        sharpe_score = 0.4
+    elif sharpe >= 0.7:
+        sharpe_score = 0.2
+    else:
+        sharpe_score = 0.0
+
+    # Autocorrelation penalty (0 to -AUTOCORR_PENALTY_MAX)
+    # No penalty if in optimal range, linear penalty scaling down to AUTOCORR_PENALTY_FLOOR
+    if AUTOCORR_OPTIMAL_LOW <= autocorr <= AUTOCORR_OPTIMAL_HIGH:
+        autocorr_penalty = 0.0
+    elif autocorr > AUTOCORR_OPTIMAL_HIGH:
+        # Too slow — mild penalty scaling from 0.95 to 1.0
+        overshoot = (autocorr - AUTOCORR_OPTIMAL_HIGH) / (1.0 - AUTOCORR_OPTIMAL_HIGH + 1e-8)
+        autocorr_penalty = min(overshoot, 1.0) * AUTOCORR_PENALTY_MAX
+    elif autocorr < AUTOCORR_PENALTY_FLOOR:
+        # Below floor — full penalty
+        autocorr_penalty = AUTOCORR_PENALTY_MAX
+    else:
+        # Between floor and optimal low — linear penalty
+        # autocorr_penalty goes from AUTOCORR_PENALTY_MAX (at floor) to 0 (at optimal low)
+        ratio = (AUTOCORR_OPTIMAL_LOW - autocorr) / (AUTOCORR_OPTIMAL_LOW - AUTOCORR_PENALTY_FLOOR + 1e-8)
+        autocorr_penalty = min(max(ratio, 0.0), 1.0) * AUTOCORR_PENALTY_MAX
+
+    # Weighted composite score (t-stat + sharpe only, then subtract autocorr penalty)
+    metric_score = WEIGHT_TSTAT * tstat_score + WEIGHT_SHARPE * sharpe_score
+    metric_score = max(metric_score - autocorr_penalty, 0.0)
+
+    # Judge score (qualitative) — weight is 0.0 by default
+    judge_score = judge_result.get("score", 0.5)
+
+    # Final combined score
+    final_score = metric_weight * metric_score + judge_weight * judge_score
+
+    # Ensure minimum score for valid output
+    final_score = max(final_score, MIN_SCORE_VALID_OUTPUT)
+
+    # Pass criteria:
+    # 1. Statistically significant (t-stat >= threshold)
+    # 2. Sharpe above minimum useful level
+    # 3. Combined score >= 0.5
+    pass_threshold = tstat >= TSTAT_THRESHOLD and sharpe >= SHARPE_THRESHOLD
+    passed = pass_threshold and final_score >= 0.5
+
+    return final_score, passed
+
+
+def _all_finite(values: list[float]) -> bool:
+    """Return True if all values are finite floats."""
+    for value in values:
+        try:
+            if not np.isfinite(float(value)):
+                return False
+        except (TypeError, ValueError):
+            return False
+    return True
+
+
+# =============================================================================
+# Main Evaluation
+# =============================================================================
+
+
+async def evaluate_async() -> dict:
+    """Run full evaluation with enhanced metrics and LLM judge."""
+    # Paths
+    signal_code_path = Path("/app/starter_code/code.py")
+    test_path = Path("/tests/test.parquet")
+    final_eval_features_path = Path("/app/data/final_eval_features.parquet")
+    results_path = Path("/app/output/results.json")
+    output_path = Path("/app/output/signal.parquet")
+    full_output_path = Path("/app/output/signal_full.parquet")
+    plots_dir = Path("/app/output/plots")
+
+    # Clear old outputs to ensure fresh results each run
+    for old_file in [
+        results_path,
+        output_path,
+        full_output_path,
+        Path("/app/output/judge_result.json"),
+    ]:
+        if old_file.exists():
+            old_file.unlink()
+    if plots_dir.exists():
+        for png in plots_dir.glob("*.png"):
+            png.unlink()
+
+    plots_dir.mkdir(parents=True, exist_ok=True)
+
+    # Check signal code exists
+    if not signal_code_path.exists():
+        return {"error": "No code.py found", "passed": False, "score": 0.0}
+
+    policy_violations = _source_policy_violations(signal_code_path)
+    if policy_violations:
+        result = _policy_failure_result(policy_violations)
+        _write_json(results_path, result)
+        print("[evaluate] Rejected submitted code:")
+        for violation in policy_violations:
+            print(f"  - {violation}")
+        print("FINAL SCORE: 0.0000")
+        return result
+
+    # Load test data (OOS)
+    if not test_path.exists():
+        return {"error": "Test data not found", "passed": False, "score": 0.0}
+
+    test_df = pl.read_parquet(test_path)
+
+    # Load training data (IS) for comparison
+    train_path = Path("/app/data/train.parquet")
+    train_df = pl.read_parquet(train_path) if train_path.exists() else None
+
+    # Write a point-in-time final eval feature view for submitted signal code.
+    # Train rows retain labels for fitting. Hidden prediction rows retain
+    # features but have return-like labels scrubbed before submitted code sees
+    # them. The verifier keeps true hidden returns in test_df for scoring.
+    final_eval_feature_metadata = _write_final_eval_feature_data(
+        train_df,
+        test_df,
+        final_eval_features_path,
+    )
+    final_eval_feature_df = pl.read_parquet(final_eval_features_path)
+
+    # Run agent's code
+    try:
+        import importlib.util
+
+        # Clear any cached version of the module to ensure fresh import
+        module_name = "signal_module"
+        if module_name in sys.modules:
+            del sys.modules[module_name]
+
+        spec = importlib.util.spec_from_file_location(module_name, signal_code_path)
+        signal_module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = signal_module  # Register before exec to handle circular imports
+        spec.loader.exec_module(signal_module)
+        signal_df_full = signal_module.build_signal(str(final_eval_features_path))
+    except Exception as e:
+        import traceback
+
+        traceback.print_exc()
+        return {"error": f"Failed to run signal code: {e}", "passed": False, "score": 0.0}
+
+    # Validate schema
+    required_cols = {"timestamp_agg", "ticker", "signal"}
+    if not required_cols.issubset(set(signal_df_full.columns)):
+        return {
+            "error": f"Missing columns. Required: {required_cols}",
+            "passed": False,
+            "score": 0.0,
+        }
+
+    signal_df_full.write_parquet(full_output_path)
+    signal_df = _filter_signal_period(signal_df_full, final_eval_feature_df, prediction=True)
+    if len(signal_df) == 0:
+        return {
+            "error": "No prediction-period signal rows returned by build_signal",
+            "passed": False,
+            "score": 0.0,
+        }
+    signal_df.write_parquet(output_path)
+
+    # Preprocess: cross-sectional z-score and clip at ±4σ
+    signal_df = _preprocess_signal(signal_df)
+    print(f"[evaluate] Preprocessed signal (z-scored, clipped ±4σ)")
+
+    # Debug: print signal and test data info
+    print(f"[evaluate] signal_df shape: {signal_df.shape}")
+    print(f"[evaluate] signal_df columns: {signal_df.columns}")
+    print(f"[evaluate] signal_df sample:\n{signal_df.head(5)}")
+    print(f"[evaluate] test_df shape: {test_df.shape}")
+    print(f"[evaluate] test_df columns: {test_df.columns}")
+    print(f"[evaluate] test_df sample:\n{test_df.head(5)}")
+
+    # Check signal values
+    signal_stats = signal_df["signal"].describe()
+    print(f"[evaluate] signal stats:\n{signal_stats}")
+
+    # Compute IC per timestamp
+    ic_df = compute_ic_per_timestamp(signal_df, test_df)
+    print(f"[evaluate] ic_df shape: {ic_df.shape}")
+    if len(ic_df) == 0:
+        return {"error": "No valid IC computations", "passed": False, "score": 0.0}
+
+    # Aggregate IC metrics
+    ic_values = ic_df["ic"].to_numpy()
+    mean_ic = float(np.mean(ic_values))
+    ic_std = float(np.std(ic_values))
+    ic_positive_pct = float((ic_values > 0).mean())
+    ic_tstat_dk = compute_dk_tstat(signal_df, test_df)
+
+    # Run backtest using alphalib
+    backtest_results_df, backtest_metrics, timestamps, symbols = run_backtest_with_alphalib(
+        signal_df, test_df
+    )
+    # Use daily-aggregated Sharpe (sum hourly to daily, annualize with 252)
+    signal_return_sharpe = compute_daily_sharpe(backtest_results_df)
+    max_drawdown = backtest_metrics.get("max_drawdown", 0.0)
+    turnover_ann = backtest_metrics.get("turnover_ann", 0.0)
+
+    # Debug mode: save diagnostic parquet files
+    if os.environ.get("DEBUG_MODE", "").lower() in ("1", "true", "yes"):
+        _test_with_next = test_df.sort(["ticker", "timestamp_agg"]).with_columns(
+            pl.col(RETURN_COLUMN_NAME).shift(-1).over("ticker").alias("return_next")
+        )
+        _debug_joined = signal_df.join(
+            _test_with_next.select(["timestamp_agg", "ticker", RETURN_COLUMN_NAME, "return_next"]),
+            on=["timestamp_agg", "ticker"],
+            how="inner",
+        )
+        _save_debug_parquets(Path("/app/output/debug"), backtest_results_df, _debug_joined)
+
+    # Compute other metrics
+    autocorrelation = compute_autocorrelation(signal_df)
+    quantile_metrics = compute_quantile_metrics(signal_df, test_df)
+    ic_decay = compute_ic_decay(signal_df, test_df)
+
+    # Check for cheating (high correlation with returns)
+    return_corr = compute_return_correlation(signal_df, test_df)
+    cheating_detected = abs(return_corr) > 0.90
+
+    # Coverage
+    n_timestamps = len(ic_df)
+    n_symbols_mean = len(symbols) if symbols else 0
+    coverage_pct = (
+        len(signal_df) / (n_timestamps * n_symbols_mean)
+        if n_timestamps > 0 and n_symbols_mean > 0
+        else 0.0
+    )
+
+    # =========================================================================
+    # Compute IN-SAMPLE (training data) metrics for comparison
+    # =========================================================================
+    is_metrics = {}
+    if train_df is not None:
+        try:
+            # Reuse the same one-shot signal output for in-sample diagnostics.
+            # This supports agents that fit once on train rows and predict only
+            # where is_prediction_period=True, while avoiding a second call with
+            # a different data contract.
+            print("[evaluate] Computing in-sample metrics on training data...")
+            signal_df_is = _filter_signal_period(
+                signal_df_full,
+                final_eval_feature_df,
+                prediction=False,
+            )
+            if len(signal_df_is) == 0:
+                raise ValueError("No train-period signal rows returned by build_signal")
+            signal_df_is = _preprocess_signal(signal_df_is)
+
+            # Compute IS IC
+            ic_df_is = compute_ic_per_timestamp(signal_df_is, train_df)
+            if len(ic_df_is) > 0:
+                ic_values_is = ic_df_is["ic"].to_numpy()
+                is_metrics["mean_ic"] = float(np.mean(ic_values_is))
+                is_metrics["ic_std"] = float(np.std(ic_values_is))
+                is_metrics["ic_positive_pct"] = float((ic_values_is > 0).mean())
+                is_metrics["ic_tstat_dk"] = compute_dk_tstat(signal_df_is, train_df)
+
+                # IS backtest
+                is_backtest_results, is_backtest_metrics, _, _ = run_backtest_with_alphalib(
+                    signal_df_is, train_df
+                )
+                # Use daily-aggregated Sharpe for IS as well
+                is_metrics["sharpe_net"] = compute_daily_sharpe(is_backtest_results)
+                is_metrics["max_drawdown"] = is_backtest_metrics.get("max_drawdown", 0.0)
+
+                # Compute IS/OOS gaps for overfitting detection
+                if abs(is_metrics["mean_ic"]) > EPS:
+                    is_metrics["ic_gap_pct"] = (
+                        (is_metrics["mean_ic"] - mean_ic) / abs(is_metrics["mean_ic"]) * 100
+                    )
+                if is_metrics["sharpe_net"] > EPS:
+                    is_metrics["sharpe_gap_pct"] = (
+                        (is_metrics["sharpe_net"] - signal_return_sharpe)
+                        / is_metrics["sharpe_net"]
+                        * 100
+                    )
+
+                print(f"[evaluate] IS Mean IC: {is_metrics['mean_ic']:.4f}")
+                print(f"[evaluate] OOS Mean IC: {mean_ic:.4f}")
+                print(f"[evaluate] IC Gap: {is_metrics.get('ic_gap_pct', 0):.1f}%")
+
+        except Exception as e:
+            print(f"[evaluate] Failed to compute IS metrics: {e}")
+            import traceback
+
+            traceback.print_exc()
+
+    # Build metrics object (OOS)
+    metrics = SignalMetrics(
+        mean_ic=mean_ic,
+        ic_std=ic_std,
+        ic_positive_pct=ic_positive_pct,
+        ic_tstat_dk=ic_tstat_dk,
+        signal_return_sharpe=signal_return_sharpe,
+        autocorrelation=autocorrelation,
+        long_short_spread=quantile_metrics["long_short_spread"],
+        monotonicity=quantile_metrics["monotonicity"],
+        n_timestamps=n_timestamps,
+        n_symbols_mean=float(n_symbols_mean),
+        coverage_pct=coverage_pct,
+        ic_decay=ic_decay,
+    )
+
+    if not _all_finite(
+        [
+            mean_ic,
+            ic_std,
+            ic_positive_pct,
+            ic_tstat_dk,
+            signal_return_sharpe,
+            autocorrelation,
+            quantile_metrics["long_short_spread"],
+            quantile_metrics["monotonicity"],
+            n_timestamps,
+            n_symbols_mean,
+            coverage_pct,
+            return_corr,
+            max_drawdown,
+            turnover_ann,
+        ]
+    ):
+        final_score = -1.0
+        passed = False
+        results = {
+            "ic": mean_ic,
+            "ic_std": ic_std,
+            "ic_positive_pct": ic_positive_pct,
+            "tstat_threshold": TSTAT_THRESHOLD,
+            "sharpe_threshold": SHARPE_THRESHOLD,
+            "n_timestamps": n_timestamps,
+            "return_correlation": return_corr,
+            "cheating_detected": cheating_detected,
+            **metrics.to_dict(),
+            "backtest_sharpe": signal_return_sharpe,
+            "backtest_max_drawdown": max_drawdown,
+            "backtest_turnover_ann": turnover_ann,
+            **backtest_metrics,
+            "in_sample": is_metrics if is_metrics else None,
+            "judge_decision": "invalid",
+            "judge_score": 0.0,
+            "judge_feedback": "Invalid deterministic metrics (NaN/inf).",
+            "judge_issues": ["Non-finite metric encountered (e.g., Sharpe/IC/Drawdown)."],
+            "judge_suggestions": [],
+            "judge_quantitative_notes": [],
+            "judge_qualitative_validity": "invalid",
+            "judge_qualitative_invalid": True,
+            "plot_analysis": {},
+            "plots": {
+                "ic_over_time": str(plots_dir / "ic_over_time.png"),
+                "ic_decay": str(plots_dir / "ic_decay.png"),
+                "equity_curve": str(plots_dir / "equity_curve.png"),
+                "calibration_curve": str(plots_dir / "calibration_curve.png"),
+            },
+            "calibration_data": {},
+            "score": final_score,
+            "passed": passed,
+        }
+        results_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(results_path, "w") as f:
+            json.dump(results, f, indent=2, default=str)
+        print(" " + "=" * 70)
+        print("EVALUATION RESULTS (OUT-OF-SAMPLE)")
+        print("=" * 70)
+        print(f"Mean IC:              {mean_ic}")
+        print(f"IC t-stat (DK):       {ic_tstat_dk}")
+        print(f"Signal Sharpe:        {signal_return_sharpe}")
+        print(f"Max Drawdown:         {max_drawdown}")
+        print(f"Turnover (ann):       {turnover_ann}")
+        print("=" * 70)
+        print("FINAL SCORE: -1.0000")
+        print("PASSED: False")
+        print("=" * 70 + " ")
+        return results
+
+    # Generate plots
+    plot_paths = []
+    try:
+        ic_plot_path = plot_ic_over_time(ic_df, str(plots_dir / "ic_over_time.png"))
+        plot_paths.append(ic_plot_path)
+        print(f"[evaluate] Generated IC plot: {ic_plot_path}")
+    except Exception as e:
+        print(f"[evaluate] Failed to generate IC plot: {e}")
+
+    try:
+        decay_plot_path = plot_ic_decay(ic_decay, str(plots_dir / "ic_decay.png"))
+        plot_paths.append(decay_plot_path)
+        print(f"[evaluate] Generated IC decay plot: {decay_plot_path}")
+    except Exception as e:
+        print(f"[evaluate] Failed to generate decay plot: {e}")
+
+    try:
+        equity_plot_path = plot_equity_curve(
+            backtest_results_df,
+            str(plots_dir / "equity_curve.png"),
+            sharpe=signal_return_sharpe,
+            max_drawdown=max_drawdown,
+        )
+        plot_paths.append(equity_plot_path)
+        print(f"[evaluate] Generated equity curve: {equity_plot_path}")
+    except Exception as e:
+        print(f"[evaluate] Failed to generate equity plot: {e}")
+        import traceback
+
+        traceback.print_exc()
+
+    calibration_data = {}
+    try:
+        calibration_plot_path, calibration_data = plot_calibration_curve(
+            signal_df,
+            test_df,
+            str(plots_dir / "calibration_curve.png"),
+            n_buckets=10,
+        )
+        plot_paths.append(calibration_plot_path)
+        print(f"[evaluate] Generated calibration curve: {calibration_plot_path}")
+    except Exception as e:
+        print(f"[evaluate] Failed to generate calibration plot: {e}")
+        import traceback
+
+        traceback.print_exc()
+
+    # Call LLM judge
+    code_content = signal_code_path.read_text()
+    judge_result = await call_llm_judge(code_content, metrics.to_dict(), plot_paths)
+    judge_result = _normalize_judge_result(judge_result)
+
+    print(f"[evaluate] Judge result: {judge_result}")
+    # save judge_result to /app/output/judge_result.json
+    judge_result_path = Path("/app/output/judge_result.json")
+    judge_result_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(judge_result_path, "w") as f:
+        json.dump(judge_result, f, indent=2, default=str)
+
+    # Handle cheating override
+    if cheating_detected:
+        judge_result = {
+            "decision": "invalid",
+            "score": 0.0,
+            "feedback": f"Cheating detected: signal has {return_corr:.2%} correlation with returns",
+            "issues": ["Signal directly uses return values"],
+            "suggestions": ["Build signal from features only, not from return column"],
+            "quantitative_notes": [],
+            "qualitative_validity": "invalid",
+            "qualitative_invalid": True,
+        }
+
+    # Compute combined score
+    final_score, passed = compute_combined_score(metrics, judge_result)
+
+    # Override pass if cheating (direct return correlation)
+    if cheating_detected:
+        passed = False
+        final_score = 0.0  # No credit for cheating
+
+    # Build results
+    results = {
+        # Core metrics (backwards compatible) - these are OOS
+        "ic": mean_ic,
+        "ic_std": ic_std,
+        "ic_positive_pct": ic_positive_pct,
+        "tstat_threshold": TSTAT_THRESHOLD,
+        "sharpe_threshold": SHARPE_THRESHOLD,
+        "n_timestamps": n_timestamps,
+        "return_correlation": return_corr,
+        "cheating_detected": cheating_detected,
+        # Signal metrics (OOS)
+        **metrics.to_dict(),
+        # Backtest metrics (from alphalib, OOS)
+        "backtest_sharpe": signal_return_sharpe,
+        "backtest_max_drawdown": max_drawdown,
+        "backtest_turnover_ann": turnover_ann,
+        **backtest_metrics,  # Include all backtest metrics
+        # In-sample metrics for overfitting detection
+        "in_sample": is_metrics if is_metrics else None,
+        # Judge results
+        "judge_decision": judge_result.get("decision", "warn"),
+        "judge_score": judge_result.get("score", 0.5),
+        "judge_feedback": judge_result.get("feedback", ""),
+        "judge_issues": judge_result.get("issues", []),
+        "judge_suggestions": judge_result.get("suggestions", []),
+        "judge_quantitative_notes": judge_result.get("quantitative_notes", []),
+        "judge_qualitative_validity": judge_result.get(
+            "qualitative_validity", judge_result.get("decision", "warn")
+        ),
+        "judge_qualitative_invalid": judge_result.get("qualitative_invalid", False),
+        "plot_analysis": judge_result.get("plot_analysis", {}),
+        # Plot paths
+        "plots": {
+            "ic_over_time": str(plots_dir / "ic_over_time.png"),
+            "ic_decay": str(plots_dir / "ic_decay.png"),
+            "equity_curve": str(plots_dir / "equity_curve.png"),
+            "calibration_curve": str(plots_dir / "calibration_curve.png"),
+        },
+        "hidden_feature_metadata": final_eval_feature_metadata,
+        "final_eval_feature_metadata": final_eval_feature_metadata,
+        # Calibration curve data
+        "calibration_data": calibration_data,
+        # Final assessment
+        "score": final_score,
+        "passed": passed,
+    }
+
+    # Save results
+    results_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(results_path, "w") as f:
+        json.dump(results, f, indent=2, default=str)
+
+    # assert that the results_path exists and is not empty
+    assert results_path.exists(), "Results file not found"
+    assert results_path.stat().st_size > 0, "Results file is empty"
+
+    # Print summary
+    print(f"\n{'=' * 70}")
+    print("EVALUATION RESULTS (OUT-OF-SAMPLE)")
+    print(f"{'=' * 70}")
+    print(f"{'Metric':<25} {'OOS':>12} {'IS':>12} {'Gap':>12}")
+    print(f"{'-' * 70}")
+
+    # Format with IS comparison if available
+    is_ic = is_metrics.get("mean_ic") if is_metrics else None
+    is_sharpe = is_metrics.get("sharpe_net") if is_metrics else None
+    is_tstat = is_metrics.get("ic_tstat_dk") if is_metrics else None
+    ic_gap = is_metrics.get("ic_gap_pct") if is_metrics else None
+    sharpe_gap = is_metrics.get("sharpe_gap_pct") if is_metrics else None
+
+    # Helper to format optional values
+    def fmt_val(v, fmt=".6f"):
+        return f"{v:{fmt}}" if v is not None else "N/A"
+
+    def fmt_gap(v):
+        return f"{v:+.1f}%" if v is not None else "N/A"
+
+    print(f"{'Mean IC':<25} {mean_ic:>12.6f} {fmt_val(is_ic):>12} {fmt_gap(ic_gap):>12}")
+    print(f"{'IC Std Dev':<25} {ic_std:>12.6f}")
+    print(f"{'IC Positive %':<25} {ic_positive_pct:>11.1%}")
+    print(f"{'DK t-stat':<25} {ic_tstat_dk:>12.2f} {fmt_val(is_tstat, '.2f'):>12}")
+    print(
+        f"{'Backtest Sharpe':<25} {signal_return_sharpe:>12.2f} {fmt_val(is_sharpe, '.2f'):>12} {fmt_gap(sharpe_gap):>12}"
+    )
+    print(f"{'Max Drawdown':<25} {max_drawdown * 100:>11.1f}%")
+    print(f"{'Turnover (ann)':<25} {turnover_ann:>12.2f}")
+    print(f"{'Autocorrelation':<25} {autocorrelation:>12.2f}")
+    print(f"{'Monotonicity':<25} {metrics.monotonicity:>12.2f}")
+    print(f"{'Long/Short Spread':<25} {metrics.long_short_spread * 10000:>10.1f} bps")
+    print(f"{'Timestamps Evaluated':<25} {n_timestamps:>12,}")
+    print(f"{'Return Correlation':<25} {return_corr:>12.4f}")
+    print(f"{'Cheating Detected':<25} {str(cheating_detected):>12}")
+
+    # Overfitting warning
+    if ic_gap is not None and ic_gap > 50:
+        print("\n⚠️  WARNING: IC gap > 50% suggests significant overfitting!")
+    if sharpe_gap is not None and sharpe_gap > 30:
+        print("⚠️  WARNING: Sharpe gap > 30% suggests potential overfitting!")
+
+    print(f"{'=' * 70}")
+    print(f"Judge Decision:       {judge_result.get('decision', 'N/A')}")
+    print(f"Judge Score:          {judge_result.get('score', 'N/A')}")
+    print(f"Judge Feedback:       {judge_result.get('feedback', 'N/A')[:100]}...")
+
+    # ── SCORING RUBRIC ────────────────────────────────────────────────────
+    # Recompute component scores for display (mirrors compute_combined_score)
+    _tstat = ic_tstat_dk  # No abs — negative t-stat = backwards signal = score 0
+    _sharpe = signal_return_sharpe
+    _autocorr = autocorrelation
+
+    if _tstat >= 4.0:
+        _ts = 1.0
+        _tg = "A  (>=4)"
+    elif _tstat >= 3.0:
+        _ts = 0.8
+        _tg = "B  (>=3)"
+    elif _tstat >= 2.0:
+        _ts = 0.6
+        _tg = "C  (>=2)"
+    elif _tstat >= 1.0:
+        _ts = 0.2
+        _tg = "D  (>=1)"
+    else:
+        _ts = 0.0
+        _tg = "F  (<1)"
+
+    if _sharpe >= 2.0:
+        _ss = 1.0
+        _sg = "A  (>=2.0)"
+    elif _sharpe >= 1.5:
+        _ss = 0.8
+        _sg = "B  (>=1.5)"
+    elif _sharpe >= 1.0:
+        _ss = 0.4
+        _sg = "C  (>=1.0)"
+    elif _sharpe >= 0.7:
+        _ss = 0.2
+        _sg = "D  (>=0.7)"
+    else:
+        _ss = 0.0
+        _sg = "F  (<0.7)"
+
+    if AUTOCORR_OPTIMAL_LOW <= _autocorr <= AUTOCORR_OPTIMAL_HIGH:
+        _ap = 0.0
+    elif _autocorr > AUTOCORR_OPTIMAL_HIGH:
+        _overshoot = (_autocorr - AUTOCORR_OPTIMAL_HIGH) / (1.0 - AUTOCORR_OPTIMAL_HIGH + 1e-8)
+        _ap = min(_overshoot, 1.0) * AUTOCORR_PENALTY_MAX
+    elif _autocorr < AUTOCORR_PENALTY_FLOOR:
+        _ap = AUTOCORR_PENALTY_MAX
+    else:
+        _ratio = (AUTOCORR_OPTIMAL_LOW - _autocorr) / (AUTOCORR_OPTIMAL_LOW - AUTOCORR_PENALTY_FLOOR + 1e-8)
+        _ap = min(max(_ratio, 0.0), 1.0) * AUTOCORR_PENALTY_MAX
+
+    _metric_pre_penalty = WEIGHT_TSTAT * _ts + WEIGHT_SHARPE * _ss
+
+    print(f"\n{'=' * 70}")
+    print("SCORING RUBRIC")
+    print(f"{'=' * 70}")
+    print(f"{'Component':<22} {'Value':>8} {'Score':>7} {'Weight':>7} {'Weighted':>9}  {'Grade'}")
+    print(f"{'-' * 70}")
+    print(f"{'DK t-stat':<22} {_tstat:>8.2f} {_ts:>7.2f} {WEIGHT_TSTAT:>7.0%} {WEIGHT_TSTAT * _ts:>9.3f}  {_tg}")
+    print(f"{'Backtest Sharpe':<22} {_sharpe:>8.2f} {_ss:>7.2f} {WEIGHT_SHARPE:>7.0%} {WEIGHT_SHARPE * _ss:>9.3f}  {_sg}")
+    print(f"{'-' * 70}")
+    print(f"{'Subtotal':<22} {'':>8} {'':>7} {'':>7} {_metric_pre_penalty:>9.3f}")
+    print(f"{'Autocorr penalty':<22} {_autocorr:>8.2f} {f'-{_ap:.2f}':>7} {'':>7} {-_ap:>+9.3f}  {'OK' if _ap == 0 else f'penalty ({AUTOCORR_OPTIMAL_LOW}-{AUTOCORR_OPTIMAL_HIGH} optimal)'}")
+    print(f"{'-' * 70}")
+    print(f"{'Metric Score':<22} {'':>8} {'':>7} {'':>7} {max(_metric_pre_penalty - _ap, 0.0):>9.3f}")
+    if cheating_detected:
+        print(f"{'CHEATING OVERRIDE':<22} {'':>8} {'':>7} {'':>7} {'0.000':>9}  (signal correlates with returns)")
+    print(f"{'=' * 70}")
+    print(f"FINAL SCORE: {final_score:.4f}")
+    print(f"PASSED: {passed}")
+    print(f"{'=' * 70}\n")
+
+    return results
+
+
+def evaluate() -> dict:
+    """Synchronous wrapper for evaluate_async."""
+    return asyncio.run(evaluate_async())
+
+
+def _check_number_from_snapshot(code_path: Path) -> int | None:
+    suffix = code_path.stem.split("_", 1)[-1]
+    return int(suffix) if suffix.isdigit() else None
+
+
+def _build_signal_from_code_snapshot(
+    code_path: Path,
+    data_path: Path,
+    module_name: str,
+) -> pl.DataFrame:
+    import importlib.util
+
+    if module_name in sys.modules:
+        del sys.modules[module_name]
+    spec = importlib.util.spec_from_file_location(module_name, code_path)
+    signal_module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = signal_module
+    spec.loader.exec_module(signal_module)
+    return signal_module.build_signal(str(data_path))
+
+
+def replay_hidden_oos_checks() -> dict[str, Any]:
+    """Replay saved /check code snapshots on hidden OOS after the agent is done."""
+    checker_dir = Path(os.environ.get("QR_EVAL_CHECKER_LOG_DIR", "/logs/checker"))
+    output_root = Path(
+        os.environ.get("QR_EVAL_HIDDEN_OOS_REPLAY_DIR", "/logs/verifier/hidden_oos_by_check")
+    )
+    test_path = Path("/tests/test.parquet")
+    train_path = Path("/app/data/train.parquet")
+    feature_path = Path("/app/data/hidden_oos_replay_features.parquet")
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    summary: dict[str, Any] = {
+        "status": "completed",
+        "checker_dir": str(checker_dir),
+        "output_root": str(output_root),
+        "results": [],
+    }
+
+    if not checker_dir.exists():
+        summary.update({"status": "skipped", "reason": f"checker dir missing: {checker_dir}"})
+        _write_json(output_root / "summary.json", summary)
+        print(f"[hidden-oos-replay] {summary['reason']}")
+        return summary
+    if not test_path.exists():
+        summary.update({"status": "skipped", "reason": f"hidden OOS data missing: {test_path}"})
+        _write_json(output_root / "summary.json", summary)
+        print(f"[hidden-oos-replay] {summary['reason']}")
+        return summary
+
+    test_df = pl.read_parquet(test_path)
+    train_df = pl.read_parquet(train_path) if train_path.exists() else None
+    summary["hidden_feature_metadata"] = _write_final_eval_feature_data(
+        train_df,
+        test_df,
+        feature_path,
+    )
+    summary["final_eval_feature_metadata"] = summary["hidden_feature_metadata"]
+    feature_df = pl.read_parquet(feature_path)
+
+    snapshots = sorted(checker_dir.glob("code_*.py"))
+    summary["snapshot_count"] = len(snapshots)
+    print(f"[hidden-oos-replay] Replaying {len(snapshots)} checker code snapshots")
+
+    for code_path in snapshots:
+        check_num = _check_number_from_snapshot(code_path)
+        if check_num is None:
+            continue
+        debug_dir = output_root / f"debug_{check_num:03d}"
+        result_path = output_root / f"result_{check_num:03d}.json"
+        result: dict[str, Any] = {
+            "check_num": check_num,
+            "code_path": str(code_path),
+            "status": "started",
+        }
+
+        policy_violations = _source_policy_violations(code_path)
+        if policy_violations:
+            result.update(
+                {
+                    "status": "policy_violation",
+                    "policy_violations": policy_violations,
+                    "score": 0.0,
+                }
+            )
+            _write_json(result_path, result)
+            summary["results"].append(result)
+            print(f"[hidden-oos-replay] check {check_num:03d}: policy violation")
+            continue
+
+        try:
+            with (
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                signal_df = _build_signal_from_code_snapshot(
+                    code_path,
+                    feature_path,
+                    f"signal_module_hidden_oos_{check_num:03d}",
+                )
+
+            required_cols = {"timestamp_agg", "ticker", "signal"}
+            if not required_cols.issubset(set(signal_df.columns)):
+                result.update(
+                    {
+                        "status": "invalid_schema",
+                        "missing_columns": sorted(required_cols - set(signal_df.columns)),
+                    }
+                )
+                _write_json(result_path, result)
+                summary["results"].append(result)
+                print(f"[hidden-oos-replay] check {check_num:03d}: invalid schema")
+                continue
+
+            signal_df = _filter_signal_period(signal_df, feature_df, prediction=True)
+            if len(signal_df) == 0:
+                result.update(
+                    {
+                        "status": "invalid_signal",
+                        "error": "No prediction-period signal rows returned by build_signal",
+                    }
+                )
+                _write_json(result_path, result)
+                summary["results"].append(result)
+                print(f"[hidden-oos-replay] check {check_num:03d}: no prediction rows")
+                continue
+
+            signal_df = _preprocess_signal(signal_df)
+            with (
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                backtest_results, backtest_metrics, _, _ = run_backtest_with_alphalib(
+                    signal_df,
+                    test_df,
+                )
+
+            _save_debug_parquets(
+                debug_dir,
+                backtest_results,
+                joined_df=None,
+                include_joined_returns=False,
+                daily_filename="oos_daily_pnl.parquet",
+                verbose=False,
+            )
+            result.update(
+                {
+                    "status": "completed",
+                    "hidden_oos_daily_pnl_path": str(debug_dir / "oos_daily_pnl.parquet"),
+                    "hidden_oos_sharpe": compute_daily_sharpe(backtest_results),
+                    "hidden_oos_max_drawdown": backtest_metrics.get("max_drawdown", 0.0),
+                }
+            )
+            _write_json(result_path, result)
+            summary["results"].append(result)
+            print(f"[hidden-oos-replay] check {check_num:03d}: completed")
+        except Exception as exc:
+            result.update({"status": "error", "error": str(exc)})
+            _write_json(result_path, result)
+            summary["results"].append(result)
+            print(f"[hidden-oos-replay] check {check_num:03d}: error: {exc}")
+
+    _write_json(output_root / "summary.json", summary)
+    return summary
+
+
+# =============================================================================
+# Checker Mode (intermediate feedback on training data)
+# =============================================================================
+
+
+def _safe_float(val, default: float = 0.0) -> float:
+    """Safely convert value to float, handling None, NaN, and non-numeric types."""
+    if val is None:
+        return default
+    try:
+        f = float(val)
+        if np.isnan(f) or np.isinf(f):
+            return default
+        return f
+    except (TypeError, ValueError):
+        return default
+
+
+def format_metrics_table(metrics: SignalMetrics) -> str:
+    """Format signal metrics as markdown table with pass/fail status.
+
+    Core metrics: t-stat (40%), Sharpe (60%), Autocorrelation (penalty).
+    Thresholds defined at top of file (keep in sync with grading.py).
+    """
+    # Safely extract values
+    ic_tstat_dk = _safe_float(metrics.ic_tstat_dk)
+    signal_return_sharpe = _safe_float(metrics.signal_return_sharpe)
+    autocorrelation = _safe_float(metrics.autocorrelation)
+
+    # Also show informational metrics (no pass/fail)
+    mean_ic = _safe_float(metrics.mean_ic)
+    ic_positive_pct = _safe_float(metrics.ic_positive_pct)
+
+    # Core metrics with thresholds
+    rows = [
+        # Core graded metrics
+        (
+            "DK t-stat",
+            f"{ic_tstat_dk:.2f}",
+            f"> {TSTAT_THRESHOLD}",
+            "PASS" if ic_tstat_dk >= TSTAT_THRESHOLD else "FAIL",
+        ),
+        (
+            "Backtest Sharpe",
+            f"{signal_return_sharpe:.2f}",
+            f"> {SHARPE_THRESHOLD} (not losing)",
+            "PASS" if signal_return_sharpe >= SHARPE_THRESHOLD else "FAIL",
+        ),
+        (
+            "Autocorrelation",
+            f"{autocorrelation:.2f}",
+            f"{AUTOCORR_OPTIMAL_LOW}-{AUTOCORR_OPTIMAL_HIGH}",
+            "PASS"
+            if AUTOCORR_OPTIMAL_LOW <= autocorrelation <= AUTOCORR_OPTIMAL_HIGH
+            else "NEEDS WORK",
+        ),
+        # Informational (not used for pass/fail)
+        ("Mean IC", f"{mean_ic:.4f}", "-", "info"),
+        ("IC Positive %", f"{ic_positive_pct:.1%}", "-", "info"),
+    ]
+
+    lines = [
+        "## Signal Quality Metrics",
+        "",
+        "| Metric | Value | Threshold | Status |",
+        "|--------|-------|-----------|--------|",
+    ]
+    for name, value, threshold, status in rows:
+        lines.append(f"| {name} | {value} | {threshold} | {status} |")
+    return "\n".join(lines)
+
+
+def format_ic_decay_table(ic_decay: dict[str, float]) -> str:
+    """Format IC decay as markdown table."""
+    lines = [
+        "## IC Term Structure",
+        "",
+        "| Horizon | IC | Interpretation |",
+        "|---------|-----|----------------|",
+    ]
+
+    def interpret(ic: float) -> str:
+        # IC = mean(z_signal * return), so values are on the order of returns (~bps)
+        if abs(ic) > 0.005:
+            return "Strong"
+        elif abs(ic) > 0.002:
+            return "Good"
+        elif abs(ic) > 0.001:
+            return "Moderate"
+        elif abs(ic) > 0.0003:
+            return "Weak"
+        else:
+            return "Decayed"
+
+    for horizon, ic in ic_decay.items():
+        lines.append(f"| {horizon} | {ic:.4f} | {interpret(ic)} |")
+    return "\n".join(lines)
+
+
+def format_calibration_table(calibration_data: dict) -> str:
+    """Format calibration curve data as markdown table."""
+    bucket_centers = calibration_data.get("bucket_centers", [])
+    avg_returns = calibration_data.get("avg_returns", [])
+    bucket_counts = calibration_data.get("bucket_counts", [])
+
+    if not bucket_centers:
+        return "## Calibration\n\nInsufficient data for calibration analysis."
+
+    lines = [
+        "## Signal Calibration (by Percentile)",
+        "",
+        "| Percentile | Avg Return (bps) | Count |",
+        "|------------|------------------|-------|",
+    ]
+
+    for center, ret, count in zip(bucket_centers, avg_returns, bucket_counts, strict=True):
+        ret_bps = ret * 10000
+        pct_label = f"{center:.0f}%"
+        lines.append(f"| {pct_label} | {ret_bps:+.1f} | {count:,} |")
+
+    # Add spread
+    if len(avg_returns) >= 2:
+        spread_bps = (avg_returns[-1] - avg_returns[0]) * 10000
+        lines.append(f"| **Long-Short Spread** | **{spread_bps:+.1f}** | |")
+
+    return "\n".join(lines)
+
+
+def format_equity_summary_table(
+    backtest_results: pl.DataFrame | None,
+    sharpe: float,
+    max_drawdown: float,
+    turnover_ann: float,
+) -> str:
+    """Format backtest summary as markdown table."""
+    lines = ["## Backtest Summary", "", "| Metric | Value |", "|--------|-------|"]
+
+    if backtest_results is not None and len(backtest_results) > 0:
+        # Total return from daily-aggregated returns (consistent with Sharpe calc)
+        if "net_ret" in backtest_results.columns:
+            daily_ret = (
+                backtest_results.with_columns(pl.col("timestamp_agg").dt.date().alias("date"))
+                .group_by("date")
+                .agg(pl.col("net_ret").sum().alias("daily_ret"))
+                .sort("date")
+            )["daily_ret"].to_numpy()
+            total_return = (float(np.prod(1.0 + daily_ret)) - 1) * 100
+            lines.append(f"| Total Return | {total_return:+.1f}% |")
+
+        # Period count
+        lines.append(f"| Periods | {len(backtest_results):,} |")
+
+    lines.append(f"| Sharpe Ratio | {sharpe:.2f} |")
+    lines.append(f"| Max Drawdown | {max_drawdown * 100:.1f}% |")
+    lines.append(f"| Ann. Turnover | {turnover_ann:.2f} |")
+
+    return "\n".join(lines)
+
+
+def compute_checker_score(metrics: SignalMetrics) -> float:
+    """Compute checker score (0-1 scale) from metrics."""
+    # Safely extract metrics with defaults
+    mean_ic = _safe_float(metrics.mean_ic)
+    ic_tstat_dk = _safe_float(metrics.ic_tstat_dk)
+    signal_return_sharpe = _safe_float(metrics.signal_return_sharpe)
+    autocorrelation = _safe_float(metrics.autocorrelation, 0.725)  # neutral default
+    monotonicity = _safe_float(metrics.monotonicity)
+
+    # Weighted by t-stat (45%), Sharpe (40%), Autocorrelation (15%)
+    tstat_score = min(max(ic_tstat_dk, 0) / 3.0, 1.0)
+    sharpe_score = min(max(signal_return_sharpe, 0) / 1.0, 1.0)
+
+    if 0.5 <= autocorrelation <= 0.95:
+        autocorr_score = 1.0
+    else:
+        autocorr_score = max(0, 1 - abs(autocorrelation - 0.725) / 0.5)
+
+    score = (
+        0.45 * tstat_score
+        + 0.40 * sharpe_score
+        + 0.15 * autocorr_score
+    )
+
+    return min(max(score, 0.0), 1.0)
+
+
+async def run_checker_async(debug: bool = False, checker_split: str = "train") -> dict:
+    """Run checker evaluation on train or validation data with tabular output.
+
+    Args:
+        debug: If True, generate plots and extract signal documentation
+        checker_split: train uses /app/data/train.parquet; val scores /tests/val.parquet
+            while passing submitted code a sanitized train+validation feature view.
+    """
+    split_key = (checker_split or "train").strip().lower()
+    if split_key not in {"train", "val"}:
+        return {
+            "score": 0.0,
+            "message": f"Unsupported checker split: {checker_split!r}",
+        }
+
+    is_validation = split_key == "val"
+    split_label = "validation" if is_validation else "training"
+    result_filename = "check_val_result.json" if is_validation else "check_result.json"
+    plots_prefix = "checker_val_plots" if is_validation else "checker_plots"
+    plot_suffix = "val" if is_validation else "train"
+    command_label = "CHECK-VAL" if is_validation else "CHECK"
+
+    # Paths - use train or validation data, never final test data for visible feedback.
+    signal_code_path = Path("/app/starter_code/code.py")
+    data_path = Path("/tests/val.parquet") if is_validation else Path("/app/data/train.parquet")
+    results_path = Path(f"/app/output/{result_filename}")
+    # Write debug plots to /app/output so they appear in job output
+    check_number = os.environ.get("CHECK_NUMBER", "0")
+    plots_dir = Path(f"/app/output/{plots_prefix}_{check_number}")
+    debug_dir = plots_dir.parent / f"debug_{check_number}"
+    if results_path.exists():
+        results_path.unlink()
+    if plots_dir.exists():
+        for png in plots_dir.glob("*.png"):
+            png.unlink()
+    if debug_dir.exists():
+        for parquet in debug_dir.glob("*.parquet"):
+            parquet.unlink()
+
+    # Check signal code exists
+    if not signal_code_path.exists():
+        return {
+            "score": 0.0,
+            "message": "No code.py found. Please implement the build_signal function.",
+        }
+
+    # Load checker data
+    if not data_path.exists():
+        return {
+            "score": 0.0,
+            "message": f"{split_label.title()} data not found at {data_path}",
+        }
+
+    data_df = pl.read_parquet(data_path)
+    print(f"[checker] Loaded {split_label} data: {data_df.shape}")
+
+    signal_input_path = data_path
+    signal_feature_df: pl.DataFrame | None = None
+    if is_validation:
+        train_path = Path("/app/data/train.parquet")
+        train_df = pl.read_parquet(train_path) if train_path.exists() else None
+        signal_input_path = Path(f"/app/data/check_val_features_{check_number}.parquet")
+        _write_final_eval_feature_data(train_df, data_df, signal_input_path)
+        signal_feature_df = pl.read_parquet(signal_input_path)
+
+    # Run agent's code
+    try:
+        import importlib.util
+
+        module_name = "signal_module_checker"
+        if module_name in sys.modules:
+            del sys.modules[module_name]
+
+        spec = importlib.util.spec_from_file_location(module_name, signal_code_path)
+        signal_module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = signal_module
+        spec.loader.exec_module(signal_module)
+        signal_df_full = signal_module.build_signal(str(signal_input_path))
+    except Exception as e:
+        import traceback
+
+        tb = traceback.format_exc()
+        return {
+            "score": 0.0,
+            "message": f"Failed to run signal code:\n```\n{e}\n```\n\nFull traceback:\n```\n{tb}\n```",
+        }
+
+    signal_df = signal_df_full
+    if is_validation:
+        if signal_feature_df is None:
+            return {
+                "score": 0.0,
+                "message": "Validation feature view was not created.",
+            }
+        signal_df = _filter_signal_period(signal_df_full, signal_feature_df, prediction=True)
+        if len(signal_df) == 0:
+            return {
+                "score": 0.0,
+                "message": "No validation prediction-period signal rows returned by build_signal.",
+            }
+
+    # Validate schema
+    required_cols = {"timestamp_agg", "ticker", "signal"}
+    if not required_cols.issubset(set(signal_df.columns)):
+        missing = required_cols - set(signal_df.columns)
+        return {
+            "score": 0.0,
+            "message": f"Missing required columns: {missing}. Your DataFrame must have: timestamp_agg, ticker, signal",
+        }
+
+    # Preprocess: cross-sectional z-score and clip at ±4σ
+    signal_df = _preprocess_signal(signal_df)
+    print(f"[checker] Preprocessed signal (z-scored, clipped ±4σ)")
+
+    # OPTIMIZATION: Join signal with checker data ONCE, including next-period return
+    print(f"[checker] Joining signal with {split_label} data...")
+    data_with_future = data_df.sort(["ticker", "timestamp_agg"]).with_columns(
+        pl.col(RETURN_COLUMN_NAME).shift(-1).over("ticker").alias("return_next")
+    )
+    # Only select columns that exist in the checker frame.
+    select_cols = ["timestamp_agg", "ticker", RETURN_COLUMN_NAME, "return_next"]
+    if "funding_rate" in data_df.columns:
+        select_cols.append("funding_rate")
+    joined_df = signal_df.join(
+        data_with_future.select(select_cols),
+        on=["timestamp_agg", "ticker"],
+        how="inner",
+    )
+    print(f"[checker] Joined shape: {joined_df.shape}")
+
+    if len(joined_df) == 0:
+        return {
+            "score": 0.0,
+            "message": "Could not join signal with data - check that your signal has matching timestamps and tickers.",
+        }
+
+    # Compute metrics using pre-joined df
+    print("[checker] Computing IC metrics...")
+    ic_df = compute_ic_per_timestamp(signal_df, data_df, joined_df=joined_df)
+    if ic_df is None or len(ic_df) == 0:
+        return {
+            "score": 0.0,
+            "message": "Could not compute IC - check that your signal overlaps with the data timestamps and tickers.",
+        }
+
+    mean_ic = ic_df["ic"].mean()
+    ic_std = ic_df["ic"].std()
+    ic_positive_pct = (ic_df["ic"] > 0).mean()
+    n_timestamps = len(ic_df)
+    n_symbols_mean = signal_df.group_by("timestamp_agg").agg(pl.count()).get_column("count").mean()
+
+    # Compute DK t-stat via panel regression: return_{i,t+1} ~ signal_{i,t}
+    ic_tstat_dk = compute_dk_tstat(signal_df, data_df)
+
+    # Compute return correlation (cheating check) using pre-joined df
+    return_corr = compute_return_correlation(signal_df, data_df, joined_df=joined_df)
+    cheating_detected = abs(return_corr) > 0.90
+
+    # Run backtest (still needs its own join for weights normalization)
+    print("[checker] Running backtest...")
+    backtest_results, backtest_metrics, _, _ = run_backtest_with_alphalib(signal_df, data_df)
+    # Use daily-aggregated Sharpe (sum hourly to daily, annualize with 252)
+    signal_return_sharpe = compute_daily_sharpe(backtest_results)
+    max_drawdown = backtest_metrics.get("max_drawdown", 0.0)
+    turnover_ann = backtest_metrics.get("turnover_ann", 0.0)
+
+    # Debug: compare Sharpe calculations
+    alphalib_sharpe = backtest_metrics.get("sharpe_net", 0.0)
+    print(f"[checker] Sharpe comparison: alphalib={alphalib_sharpe:.2f}, daily_agg={signal_return_sharpe:.2f}")
+
+    # Compute autocorrelation (only uses signal_df, no join needed)
+    autocorrelation = compute_autocorrelation(signal_df)
+
+    # Compute quantile metrics using pre-joined df
+    quantile_result = compute_quantile_metrics(signal_df, data_df, joined_df=joined_df)
+    long_short_spread = quantile_result["long_short_spread"]
+    monotonicity = quantile_result["monotonicity"]
+
+    # Compute IC decay (needs shifted returns, but can reuse joined_df base)
+    ic_decay = compute_ic_decay(signal_df, data_df, joined_df=joined_df)
+
+    # Compute calibration data using pre-joined df
+    calibration_data = compute_calibration_curve(signal_df, data_df, joined_df=joined_df)
+
+    coverage_pct = n_timestamps / max(len(data_df.select("timestamp_agg").unique()), 1)
+
+    # Build metrics object
+    metrics = SignalMetrics(
+        mean_ic=mean_ic,
+        ic_std=ic_std,
+        ic_positive_pct=ic_positive_pct,
+        ic_tstat_dk=ic_tstat_dk,
+        signal_return_sharpe=signal_return_sharpe,
+        autocorrelation=autocorrelation,
+        long_short_spread=long_short_spread,
+        monotonicity=monotonicity,
+        n_timestamps=n_timestamps,
+        n_symbols_mean=n_symbols_mean,
+        coverage_pct=coverage_pct,
+        ic_decay=ic_decay,
+    )
+
+    # Compute score
+    score = compute_checker_score(metrics)
+    if cheating_detected:
+        score = 0.0
+
+    # Generate tables
+    tables = [
+        format_metrics_table(metrics),
+        "",
+        format_ic_decay_table(ic_decay),
+        "",
+        format_calibration_table(calibration_data),
+        "",
+        format_equity_summary_table(
+            backtest_results, signal_return_sharpe, max_drawdown, turnover_ann
+        ),
+    ]
+
+    # Build message
+    message_parts = [
+        "=" * 70,
+        f"{command_label} #{check_number} RESULTS ({split_label.upper()})",
+        "=" * 70,
+        "",
+    ]
+
+    if cheating_detected:
+        message_parts.append(
+            f"**WARNING: Cheating detected!** Signal has {return_corr:.1%} correlation with returns.\n"
+        )
+        message_parts.append("Your signal must NOT directly use the return column.\n")
+
+    message_parts.extend(tables)
+
+    # Add suggestions based on metrics
+    suggestions = []
+    if metrics.signal_return_sharpe < 0.5:
+        suggestions.append("Backtest Sharpe is low. Signal may have too much noise or poor timing.")
+    if metrics.autocorrelation < 0.5:
+        suggestions.append(
+            "Low autocorrelation suggests high turnover. Consider smoothing your signal."
+        )
+    if metrics.autocorrelation > 0.95:
+        suggestions.append("Very high autocorrelation may indicate the signal changes too slowly.")
+    if metrics.monotonicity < 0.5:
+        suggestions.append(
+            "Poor monotonicity - higher signal values don't consistently predict higher returns."
+        )
+
+    if suggestions:
+        message_parts.append("\n## Suggestions\n")
+        for s in suggestions:
+            message_parts.append(f"- {s}")
+
+    message = "\n".join(message_parts)
+
+    # Always print the metrics summary (flush to ensure it appears before debug output)
+    print("\n" + message + "\n", flush=True)
+
+    # Debug mode: generate plots and extract signal documentation
+    debug_info = {}
+    if debug:
+        print("\n" + "=" * 70)
+        print(f"DEBUG MODE: Generating {split_label} data plots and extracting signal info")
+        print("=" * 70)
+
+        # Create plots directory
+        plots_dir.mkdir(parents=True, exist_ok=True)
+
+        # Save diagnostic parquet files
+        include_checker_joined_returns = (
+            os.environ.get("QR_EVAL_ENABLE_CHECKER_JOINED_RETURNS", "").strip().lower()
+            not in {"", "0", "false", "no", "off"}
+        )
+        _save_debug_parquets(
+            debug_dir,
+            backtest_results,
+            joined_df,
+            include_joined_returns=include_checker_joined_returns,
+        )
+
+        # Generate IC over time plot
+        plot_paths = []
+        try:
+            ic_plot_path = plot_ic_over_time(
+                ic_df,
+                str(plots_dir / f"ic_over_time_{plot_suffix}.png"),
+            )
+            plot_paths.append(ic_plot_path)
+            print(f"[debug] Generated IC plot: {ic_plot_path}")
+        except Exception as e:
+            print(f"[debug] Failed to generate IC plot: {e}")
+
+        # Generate IC decay plot
+        try:
+            decay_plot_path = plot_ic_decay(
+                ic_decay,
+                str(plots_dir / f"ic_decay_{plot_suffix}.png"),
+            )
+            plot_paths.append(decay_plot_path)
+            print(f"[debug] Generated IC decay plot: {decay_plot_path}")
+        except Exception as e:
+            print(f"[debug] Failed to generate decay plot: {e}")
+
+        # Generate equity curve
+        try:
+            equity_plot_path = plot_equity_curve(
+                backtest_results,
+                str(plots_dir / f"equity_curve_{plot_suffix}.png"),
+                sharpe=signal_return_sharpe,
+                max_drawdown=max_drawdown,
+            )
+            plot_paths.append(equity_plot_path)
+            print(f"[debug] Generated equity curve: {equity_plot_path}")
+        except Exception as e:
+            print(f"[debug] Failed to generate equity plot: {e}")
+
+        # Generate calibration curve
+        try:
+            calibration_plot_path, calibration_data = plot_calibration_curve(
+                signal_df,
+                data_df,
+                str(plots_dir / f"calibration_curve_{plot_suffix}.png"),
+                n_buckets=10,
+            )
+            plot_paths.append(calibration_plot_path)
+            print(f"[debug] Generated calibration curve: {calibration_plot_path}")
+            debug_info["calibration_data"] = calibration_data
+        except Exception as e:
+            print(f"[debug] Failed to generate calibration plot: {e}")
+
+        debug_info["plot_paths"] = plot_paths
+
+        # Extract signal description from code
+        signal_description = extract_signal_description(signal_code_path)
+        if signal_description:
+            debug_info["signal_description"] = signal_description
+            print(f"\n[debug] Signal Description:\n{'-' * 40}")
+            print(signal_description)
+            print("-" * 40)
+        else:
+            print("\n[debug] No signal description found in code.")
+            print(
+                "[debug] Tip: Add SIGNAL_DESCRIPTION = '''...''' or a docstring to build_signal()"
+            )
+
+        # Print the agent's code for reference
+        print(f"\n[debug] Agent's code ({signal_code_path}):")
+        print("-" * 40)
+        print(signal_code_path.read_text())
+        print("-" * 40)
+
+        print(f"\n[debug] Debug plots saved to: {plots_dir}")
+
+    result = {
+        "score": score,
+        "message": message,
+        "metadata": {
+            **metrics.to_dict(),
+            "return_correlation": return_corr,
+            "cheating_detected": cheating_detected,
+        },
+    }
+
+    if debug:
+        result["debug"] = debug_info
+
+    # Save result
+    results_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(results_path, "w") as f:
+        json.dump(result, f, indent=2, default=str)
+
+    print(f"[checker] Score: {score:.2f}")
+    return result
+
+
+def run_checker(debug: bool = False, checker_split: str = "train") -> dict:
+    """Synchronous wrapper for run_checker_async."""
+    return asyncio.run(run_checker_async(debug=debug, checker_split=checker_split))
+
+
+def extract_signal_description(code_path: Path) -> str | None:
+    """
+    Extract signal description/formula from agent's code.
+
+    Looks for:
+    1. SIGNAL_DESCRIPTION variable
+    2. Docstring in build_signal function
+    3. Module-level docstring
+    """
+    try:
+        import ast
+
+        code = code_path.read_text()
+        tree = ast.parse(code)
+
+        # Look for SIGNAL_DESCRIPTION = "..." assignment
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id == "SIGNAL_DESCRIPTION":
+                        if isinstance(node.value, ast.Constant):
+                            return str(node.value.value)
+
+        # Look for build_signal function docstring
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == "build_signal":
+                docstring = ast.get_docstring(node)
+                if docstring:
+                    return f"build_signal docstring:\n{docstring}"
+
+        # Fall back to module docstring
+        module_docstring = ast.get_docstring(tree)
+        if module_docstring:
+            return f"Module docstring:\n{module_docstring}"
+
+        return None
+    except Exception as e:
+        print(f"[debug] Could not extract signal description: {e}")
+        return None
+
+
+def parse_args():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(description="Signal evaluation script")
+    parser.add_argument(
+        "--checker",
+        action="store_true",
+        help="Run in checker mode (uses training data, generates tables, no LLM judge)",
+    )
+    parser.add_argument(
+        "--checker-split",
+        choices=["train", "val"],
+        default=os.environ.get("CHECK_SPLIT", "train"),
+        help="Data split to use in checker mode",
+    )
+    parser.add_argument(
+        "--replay-hidden-oos-checks",
+        action="store_true",
+        help="Replay saved checker code snapshots on hidden OOS after agent execution",
+    )
+    args = parser.parse_args()
+
+    # Check DEBUG_MODE environment variable to enable plot generation
+    args.debug = os.environ.get("DEBUG_MODE", "").lower() in ("1", "true", "yes")
+
+    return args
+
+
+def main():
+    """Entry point."""
+    args = parse_args()
+
+    try:
+        if args.replay_hidden_oos_checks:
+            replay_hidden_oos_checks()
+            sys.exit(0)
+        elif args.checker:
+            results = run_checker(debug=args.debug, checker_split=args.checker_split)
+            # Checker always exits 0 - it's just feedback
+            sys.exit(0)
+        else:
+            results = evaluate()
+            # Exit with appropriate code for verifier
+            if results.get("passed", False):
+                sys.exit(0)
+            else:
+                sys.exit(1)
+    except Exception as e:
+        print(f"Exception during evaluation: {e}")
+        import traceback
+
+        traceback.print_exc()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

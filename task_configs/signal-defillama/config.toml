@@ -1,0 +1,77 @@
+[metadata]
+name = "signal-defillama"
+type = "signal"
+difficulty = "medium"
+tags = ["signal", "cex", "dex", "fees", "defillama", "on-chain", "flow"]
+description = "Build signal from DeFiLlama CEX holdings, DEX volumes, and fees data"
+
+[resources]
+agent_timeout_sec = 3600.0
+memory_mb = 16384
+
+[instruction]
+title = "DeFiLlama CEX/DEX Flow Signal"
+
+objective = """
+Build a signal using DeFiLlama on-chain flow data: CEX token holdings, DEX volumes, and protocol fees.
+
+**Key Data Sources:**
+- **CEX Holdings**: Token balances on centralized exchanges 
+- **DEX Volumes**: Trading activity by chain (high volume = engagement)
+- **Fees**: Protocol revenue by chain (fees = usage/value capture)
+- **Stablecoin Flows**: Market-wide stablecoin movements on CEXs
+
+**Hypothesis**: Protocol fee growth indicates network usage and value capture, which should be bullish.
+DEX volume and fee changes reflect ecosystem health and engagement.
+
+The data is at daily frequency joined to hourly returns with a 1-day lag.
+
+**Important**: Not all features cover all tickers. Fees/DEX data covers chain tokens (ETH, etc.),
+while CEX data covers tokens held on exchanges. You may need to handle missing values carefully.
+
+Your goal: Build a predictive signal from these flow metrics.
+"""
+
+allowed_features = [
+    "cex_pct_1d",
+    "cex_pct_7d",
+    "dex_pct_1d",
+    "dex_pct_7d",
+    "fees_pct_1d",
+    "fees_pct_7d",
+    "stables_pct_1d",
+    "stables_pct_7d",
+    "volume",
+    "close",
+    "residual_return",
+    "return"
+]
+
+data_columns_extra_rows = """
+| `cex_pct_1d` | 1-day percent change in CEX token holdings |
+| `cex_pct_7d` | 7-day percent change in CEX token holdings |
+| `dex_pct_1d` | 1-day percent change in DEX volume |
+| `dex_pct_7d` | 7-day percent change in DEX volume |
+| `fees_pct_1d` | 1-day percent change in protocol fees |
+| `fees_pct_7d` | 7-day percent change in protocol fees |
+| `stables_pct_1d` | 1-day percent change in stablecoin CEX holdings (market-wide) |
+| `stables_pct_7d` | 7-day percent change in stablecoin CEX holdings (market-wide) |
+"""
+
+ideas = [
+    """
+    Finding a signal that works may require testing a bunch of variations: 
+     - think about what the data means and compare that with what empirical tests show: 
+        - What are possible reasons for each flow? What does that imply about sentiment and mechanical returns?
+        - What do protocol fees indicate about traction and sentiment? 
+        - Do these flows behave the same in times of market stress vs exuberance?
+    - different constructions of those hypotheses around flow: 
+        - short and long term versions of individual token level flows from CEXs
+        - normalizing by volatility or relative to volume or something else
+    - aggregating different sub-features into the signal with a rolling linear regression fit against no
+    - clip returns or normalize them somehow
+    - consider if this effect is a conditioner for a simple momentum, mean reversion or volume signal
+    - different normalizations of features both temporally (i.e time series z score) or cross-sectionally
+    """,
+    "Note that turnover may be an issue. If you are finding fitting to 1 period returns is too fast, calculate longer term forward returns and use that to fit any rolling fit signals. Make sure to correctly mask returns though. For example if your forward horizon is K, your rolling window for time T should end data at time T-K.",
+]

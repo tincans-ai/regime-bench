@@ -1,0 +1,171 @@
+# Signal-Upbit Task Configuration
+# Cross-venue signal using Korean exchange (Upbit) data
+
+[metadata]
+name = "signal-upbit"
+type = "signal"
+difficulty = "hard"
+tags = ["signal", "cross-venue", "upbit", "korea", "premium", "flow"]
+description = "Build signal from cross-venue data: Korean exchange (Upbit) vs global (Binance)"
+
+[resources]
+agent_timeout_sec = 1800.0
+memory_mb = 8192
+
+[instruction]
+title = "Cross-Venue Signal: Upbit (Korea) vs Binance (Global)"
+
+allowed_features = [
+    "upbit_close_usd",
+    "binance_close_usd",
+    "upbit_volume",
+    "binance_volume",
+    "kimchi_premium_pct",
+    "volume_ratio",
+    "close",
+    "volume",
+]
+
+
+data_columns_extra_rows = """
+| `upbit_close_usd` | Upbit close price converted to USD |
+| `binance_close_usd` | Binance close price in USD |
+| `upbit_volume` | Upbit trading volume (base asset) |
+| `binance_volume` | Binance trading volume (base asset) |
+| `kimchi_premium_pct` | (Upbit - Binance) / Binance * 100, clipped to [-10, 10] |
+| `volume_ratio` | Upbit volume / Binance volume |
+"""
+
+objective = """
+Build a predictive signal using **cross-venue** information from Upbit (Korean retail exchange) and Binance (global exchange).
+
+**Context:**
+- **Upbit** is Korea's largest crypto exchange, dominated by retail traders
+- **Binance** is the world's largest exchange with global institutional flow
+- Price differences ("kimchi premium") and volume patterns between venues may contain predictive information
+- Korean retail trading activity often differs from global markets
+
+**Data Available:**
+You have hourly data with prices and volumes from both exchanges:
+- Upbit prices converted to USD (using KRW/USD FX rate)
+- Binance prices in USD
+- Volume from both venues
+- Pre-computed kimchi premium (Upbit price vs Binance price difference)
+
+**IMPORTANT: The Upbit data is contemporaneous with Binance data (same timestamps). In production, Upbit data arrives with ~1 hour delay. You MUST lag all Upbit-derived features by at least 1 hour (e.g., `.shift(1).over("ticker")`) to avoid look-ahead bias.**
+
+**Your Goal:**
+Discover cross-venue patterns that predict future Binance returns. Consider:
+- Price dislocations between venues
+- Volume patterns and divergences
+- How Korean retail activity relates to subsequent global price moves
+- Whether certain patterns are stronger during specific market conditions
+
+The signal should predict **forward Binance returns** (next hour).
+"""
+
+
+ideas = [
+    """
+    Kimchi premium as a retail sentiment / capital-controls proxy:
+    - Treat the kimchi premium as a proxy for Korean retail demand pressure and local constraints (on/off-ramp frictions, capital controls, latency of arbitrage).
+    - Hypothesis: premium widens when Korean retail is risk-on; the key question is whether that predicts future global (Binance) moves or represents local-only dislocation.
+    - Separate “informational” premium (predictive) from “frictional” premium (pure arbitrage wedge).
+    """,
+
+    """
+    Premium mean reversion vs premium momentum:
+    - Test whether extreme premium levels predict convergence (mean reversion), consistent with arbitrage catching up.
+    - Test whether changes in premium predict continuation in Binance returns (premium momentum), consistent with Korea being an early demand signal.
+    - Evaluate asymmetry: widening premium may behave differently than shrinking premium.
+    """,
+
+    """
+    Decompose premium into level, change, and acceleration:
+    - Use the premium level (current dislocation), first difference (hourly change), and second difference (acceleration).
+    - Hypothesis: acceleration captures “retail impulse” more cleanly than levels, which may be sticky due to constraints.
+    - Normalize these components to compare across tokens and regimes.
+    """,
+
+    """
+    Cross-venue return lead–lag:
+    - Compute Upbit USD returns vs Binance returns and test lead–lag relationships at multiple lags.
+    - Hypothesis: Upbit may lead during certain times (Korean daytime) or in retail-dominated tokens.
+    - Explicitly test whether lead–lag holds after controlling for market-wide moves.
+    """,
+
+    """
+    Volume divergence and attention shocks:
+    - Use Upbit volume spikes relative to Binance volume as a proxy for Korea-specific attention or retail bursts.
+    - Compare “Upbit-only” volume surges vs “Binance-only” surges; they may imply different subsequent Binance outcomes.
+    - Consider whether volume divergence predicts volatility expansion vs directional returns.
+    """,
+
+    """
+    Volume-weighted premium and liquidity relevance:
+    - Weight premium features by volume_ratio or by deviations of Upbit volume from its own baseline.
+    - Hypothesis: a premium supported by unusually high Upbit volume is more informative than a premium on thin trading.
+    - Downweight or filter low-liquidity hours/tokens where premium is noisy.
+    """,
+
+    """
+    Cross-sectional ranking within the Upbit–Binance universe:
+    - Rank tokens by kimchi_premium_pct and by premium change each hour; use cross-sectional z-scores/ranks.
+    - Hypothesis: the cross-sectional tails (most abnormal premiums vs peers) are where the signal concentrates.
+    - Test sector/cluster effects implicitly by whether certain token types systematically carry premium.
+    """,
+
+    """
+    Time-series normalization and anomaly detection:
+    - Compute rolling z-scores / percentile ranks of premium and volume_ratio per token to detect “unusual vs history” states.
+    - Compare short lookbacks (fast retail shifts) vs longer lookbacks (structural premium baseline).
+    - Clip / winsorize extreme values beyond the provided [-10, 10] clipping to reduce sensitivity to microstructure noise.
+    """,
+
+    """
+    Interaction effects and conditional logic:
+    - Condition premium signals on volume_ratio (premium with high Upbit share may differ from premium with low Upbit share).
+    - Condition on market trend / volatility state: premium may behave differently in bull vs bear vs chop.
+    - Hypothesis: in strong bull trends, premium may be momentum-like; in sideways/high-vol markets, it may mean-revert.
+    """,
+
+    """
+    Time-of-day and calendar structure:
+    - Test whether predictive relationships strengthen during Korean waking hours vs non-Korean hours.
+    - Hypothesis: Upbit retail flows are time-localized, so “when” premium changes happen matters as much as “how much.”
+    - Evaluate whether signals degrade when restricting to certain hours (robustness) vs relying on a narrow window (fragility).
+    """,
+
+    """
+    Event-like behavior and structural breaks:
+    - Identify sudden step-changes in premium or volume_ratio and treat them as event signals (shock indicators).
+    - Hypothesis: sharp premium jumps can reflect local news / social propagation that later diffuses globally.
+    - Detect and downweight structural breaks from listing changes, fee changes, or data artifacts.
+    """,
+
+    """
+    Diagnostic separation: informational vs mechanical arbitrage:
+    - If premium mean reversion exists without directional Binance predictability, it may be primarily an arbitrage phenomenon.
+    - If premium changes predict Binance returns even when premium is small, it suggests informational content.
+    - Explicitly test whether the signal is just “betting on convergence” vs “forecasting global direction.”
+    """,
+
+    """
+    Signal composition and ensembling:
+    - Combine premium level, premium change, Upbit lead–lag return features, and volume divergence into an ensemble.
+    - Allow regime-dependent weights (e.g., more weight on premium momentum in trends; more on premium reversion in high vol).
+    - Prefer simple, stable components first; treat more complex interactions as incremental additions.
+    """,
+
+    """
+    Noise reduction and data quality checks:
+    - Validate KRW/USD conversion alignment; FX timing mismatches can create false premium signals.
+    - Ensure volume units match (base asset) and handle missing/zero volumes robustly.
+    - Apply smoothing (EMA) to regime indicators and avoid overreacting to single-hour prints.
+    """,
+
+    """
+    Turnover and horizon alignment considerations:
+    - Note that turnover may be an issue. If you are finding fitting to 1 period returns is too fast, calculate longer term forward returns and use that to fit any rolling fit signals. Make sure to correctly mask returns though. For example if your forward horizon is K, your rolling window for time T should end data at time T-K.
+    """
+]

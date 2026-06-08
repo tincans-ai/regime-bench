@@ -1,0 +1,99 @@
+# Signal: Time Series CNN on Volume Data
+
+[metadata]
+name = "signal-cnn-volume"
+type = "signal"
+difficulty = "hard"
+tags = ["signal", "cnn", "deep-learning", "volume", "time-series"]
+description = "Build signal using 1D CNN on volume time series"
+
+[resources]
+agent_timeout_sec = 1800.0
+memory_mb = 16384
+extra_pip_packages = ["torch>=2.0.0"]
+
+[instruction]
+title = "Time Series CNN Volume Signal"
+
+objective = """
+Evaluate whether time-series CNNs can identify exploitable structure in residual returns that is not captured by linear factor models or simple time-series statistics.
+
+The core hypothesis is that, even after removing common market components, asset-level returns may contain localized temporal patterns (e.g., bursts, shape motifs, volatility clustering asymmetries, lead–lag effects) that are difficult to model with linear regressions or summary features, but are naturally captured by convolutional filters operating over time.
+
+Economically, this task tests whether residual returns are truly noise, or whether they reflect delayed information diffusion, heterogeneous agent reaction speeds, market microstructure frictions, or nonlinear interactions between volatility, volume, and past returns.
+
+CNNs are treated as a hypothesis-testing tool rather than an assumed superior predictor. The research question is whether any detected structure is statistically stable out-of-sample, robust across assets and regimes, and economically meaningful after transaction costs.
+
+Failure modes include performance collapsing after normalization changes, strong regime dependence, or the signal reducing to known effects (momentum, reversal, volatility timing) under simpler transformations.
+"""
+
+allowed_features = [
+    "volume",
+    "close",
+    "return",
+    "residual_return"
+]
+
+
+ideas = [
+    """
+    Target definition and residualization variants:
+    - Test different normalizatios of residual returns (with vol, time series z-scored, etc)
+    - Compare predicting next-period residual return vs aggregated forward residual returns over multiple horizons.
+    - Examine whether predictability exists at specific horizons, distinguishing microstructure-driven effects from behavioral ones.
+    """,
+
+    """
+    Temporal feature representations:
+    - Use raw returns, clipped returns, volatility-scaled returns, and signed volatility as alternative inputs.
+    - Include volume, turnover, or market-cap–scaled activity to allow detection of interaction patterns (e.g., return–volume motifs).
+    - Compare overlapping vs non-overlapping windows to assess whether structure arises from autocorrelation artifacts.
+    """,
+
+    """
+    Normalization and stabilization:
+    - Apply time-series normalization (rolling z-score, rank transform, volatility scaling) to prevent sensitivity to level shifts.
+    - Compare cross-sectional normalization at each timestamp vs purely time-series normalization.
+    - Winsorize or clip extreme returns and volumes to reduce sensitivity to data errors and liquidation spikes.
+    """,
+
+    """
+    Windowing and locality assumptions:
+    - Vary input window lengths to test where predictive structure emerges.
+    - Short windows may capture microstructure or order-flow effects; longer windows may collapse to trend or reversal signals.
+    - Examine whether signal strength decays smoothly with window length, indicating genuine local structure.
+    """,
+
+    """
+    Overlap with known effects:
+    - Measure correlations between CNN-derived signals and momentum, mean reversion, volatility, and liquidity signals.
+    - Test whether residual-return predictability acts as a conditional enhancer rather than a standalone alpha.
+    - Determine whether CNNs primarily act as nonlinear filters over known effects.
+    """,
+
+    """
+    Regime conditioning:
+    - Test performance conditional on market volatility, trend strength, and drawdown regimes.
+    - Hypothesis: residual structure strengthens during stressed or high-volatility periods when linear models degrade.
+    - Evaluate regime-conditioned performance rather than unconditional averages.
+    """,
+
+    """
+    Cross-asset and cross-time robustness:
+    - Test whether learned temporal patterns generalize across assets or remain asset-specific.
+    - Evaluate stability across market eras (bull, bear, sideways) to rule out regime overfitting.
+    """,
+
+    """
+    Noise and data-quality considerations:
+    - Assess sensitivity to missing data, stale prices, and forward-filled market capitalization.
+    - Verify that predictability does not arise from data leakage or normalization artifacts.
+    """,
+
+    """
+    Composability and ensembling:
+    - Treat CNN-derived outputs as components that can be combined with linear or rule-based signals.
+    - Explore whether CNNs are more effective as feature extractors feeding downstream signal logic rather than direct predictors.
+    """,
+    "Note that turnover may be an issue. If you are finding fitting to 1 period returns is too fast, calculate longer term forward returns and use that to fit any rolling fit signals. Make sure to correctly mask returns though. For example if your forward horizon is K, your rolling window for time T should end data at time T-K."
+]

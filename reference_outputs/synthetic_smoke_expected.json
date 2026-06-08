@@ -1,0 +1,16 @@
+{
+  "backtest_sharpe": 239.3054382835749,
+  "cheating_detected": false,
+  "coverage_pct": 1.0084033613445378,
+  "ic_tstat_dk": 26.756874592533975,
+  "max_drawdown": -0.0006698497685418969,
+  "mean_ic": 0.00044438963281504814,
+  "n_timestamps": 119,
+  "passed": true,
+  "return_correlation": 0.5647588835042668,
+  "score": 1.0,
+  "signal_return_sharpe": 239.3054382835749,
+  "status": "completed",
+  "total_return": 0.13849436954271455,
+  "turnover_ann": 439.030772164859
+}

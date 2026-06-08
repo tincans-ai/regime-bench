@@ -1,0 +1,111 @@
+# Signal: Pair / Cluster Trading
+
+[metadata]
+name = "signal-pair-cluster"
+type = "signal"
+difficulty = "hard"
+tags = ["signal", "pairs", "cluster", "cointegration", "stat-arb"]
+description = "Build signal from pair/cluster relationships for statistical arbitrage"
+
+[resources]
+agent_timeout_sec = 1800.0
+memory_mb = 16384
+extra_pip_packages = ["scikit-learn>=1.4.0"]
+
+[instruction]
+title = "Pair/Cluster Trading Signal"
+
+allowed_features = [
+    "close",
+    "volume",
+    "return",
+    "residual_return",
+]
+
+objective = """
+Build and evaluate a market-neutral relative-value signal based on pairs trading, where positions are constructed from statistically and economically related assets identified via automated clustering.
+
+The core hypothesis is that subsets of assets share common drivers (sector narratives, L1/L2 ecosystems, exchange/listing effects, liquidity cohorts, shared investor bases), creating stable co-movement structure. Deviations from this structure (spreads, residuals, or relative mispricings) tend to mean-revert due to arbitrage, hedging flows, and capital reallocation among close substitutes.
+
+Automated clustering is used to discover these “economic peer groups” in a data-driven way, rather than relying on static taxonomies. The research question is whether clustering produces more robust, tradeable pair/group relationships than naïve correlation screens or hand-built categories, and whether mean reversion persists out-of-sample after accounting for regime shifts and structural breaks.
+
+The strategy direction is:
+- Identify clusters of related assets and define intra-cluster relative-value relationships (pairs or small baskets).
+- Long the assets that are cheap relative to their cluster and short the ones that are rich, targeting convergence.
+
+Key failure modes include: clusters that are unstable through time, spreads that do not mean-revert after costs, relationships driven by shared exposure to the market rather than genuine substitutability, and performance that collapses when clustering choices or normalization methods change.
+"""
+
+ideas = [
+    """
+    Clustering formulations (what defines “similar”):
+    - Cluster on correlation of returns, correlation of residual returns, distance of beta/vol profiles, or co-movement in volume/liquidity proxies.
+    - Compare clustering on raw returns vs volatility-scaled returns to avoid grouping purely by risk level.
+    - Test whether clustering on multiple feature spaces (return + volume + market_cap dynamics) yields more economically coherent peers.
+    - use different clustering techniques over different windows 
+    """,
+
+    """
+    Time variation and stability of clusters:
+    - Use rolling clustering vs exponentially weighted clustering to allow gradual evolution of peer groups.
+    - Evaluate cluster persistence metrics (e.g., fraction of assets staying in same cluster) and link stability to performance.
+    - Treat “cluster churn” as a regime indicator: high churn may imply relationships are unreliable and should be traded smaller or not at all.
+    """,
+
+    """
+    Defining the relative-value signal within a cluster:
+    - Construct spreads via simple pair ratios, basket residuals (asset vs cluster index), or rank-based mispricing within cluster.
+    - Compare linear de-meaning (asset return minus cluster mean) vs robust de-meaning (median / trimmed mean) to reduce outlier influence.
+    - Explore whether the best trade unit is a pair, a triad, or an asset vs cluster basket (more stable hedge).
+    """,
+
+    """
+    Normalization and comparability:
+    - Standardize spreads using rolling z-scores, MAD-based robust z-scores, or volatility scaling to prevent high-vol names dominating.
+    - Use cross-sectional ranking within each cluster to reduce sensitivity to distribution tails and data errors.
+    - Apply temporal normalization to ensure signals are comparable across regimes (bull/bear, high/low vol).
+    """,
+
+    """
+    Noise reduction and data cleaning:
+    - Clip extreme returns and volume spikes; winsorize spread innovations to prevent single events from driving signal.
+    - Handle missing data explicitly (drop, forward-fill where appropriate, or require minimum coverage).
+    - Detect and downweight structural breaks (listing events, major re-denominations, sustained liquidity collapses).
+    """,
+
+    """
+    Mean reversion vs momentum regimes:
+    - Test whether intra-cluster dispersion is mean-reverting overall but momentum-dominated in strong trending regimes.
+    - Condition trades on market trend strength, volatility state, or cluster-wide momentum to avoid fading strong thematic moves.
+    - Explore asymmetric behavior: reversion might be stronger after shock moves than during slow drifts.
+    """,
+
+    """
+    Exposure control and hedging quality:
+    - Evaluate how “market neutral” the constructed trades truly are by measuring realized beta and factor exposure proxies.
+    - Compare using raw returns vs residual returns for signal construction; residual returns may better isolate idiosyncratic mispricing, but can remove meaningful shared structure.
+    - Check whether performance is actually a disguised low-beta / quality / liquidity effect rather than true convergence.
+    """,
+
+    """
+    Liquidity and market-cap segmentation:
+    - Test clustering separately within liquidity cohorts or market-cap buckets so that “similarity” is not dominated by microcap noise.
+    - Hypothesis: the best pairs exist among assets with comparable liquidity and investor base, reducing execution slippage and improving convergence dynamics.
+    """,
+
+    """
+    Combining sub-ideas and ensembling:
+    - Ensemble multiple clustering views (correlation-based + beta/vol-based + volume dynamics) to reduce sensitivity to any single definition of similarity.
+    - Combine relative-value signals with filters (e.g., only trade when dispersion is high, or when cluster stability is high).
+    - Allow clusters to provide a universe definition while spreads are defined by alternative methods (pairs + basket residuals).
+    """,
+
+    """
+    Diagnostics and falsification tests:
+    - Verify convergence is not an artifact of overlapping returns, lookahead in clustering windows, or survivorship selection.
+    - Stress test by shifting clustering cutoffs, lookbacks, and normalization choices; robust signals should degrade smoothly, not collapse.
+    - Evaluate whether profitable reversion is concentrated in a few clusters/pairs (fragile) or broadly distributed (more reliable).
+    """,
+
+    "Note that turnover may be an issue. If you are finding fitting to 1 period returns is too fast, calculate longer term forward returns and use that to fit any rolling fit signals. Make sure to correctly mask returns though. For example if your forward horizon is K, your rolling window for time T should end data at time T-K.",
+]

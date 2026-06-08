@@ -1,0 +1,17 @@
+name = "report-profile"
+description = "Frozen split profile used by the RegimeBench companion report."
+
+[split]
+preset = "volume-variety"
+families = ["rolling", "random_block", "stripe"]
+count = 6
+seed = 0
+stripe_units = ["month", "week"]
+purge_hours = 24
+
+[validation]
+split = "none"
+stripe_unit = "month"
+stripe_modulus = 2
+stripe_holdout = 1
+

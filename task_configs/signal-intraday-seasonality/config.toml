@@ -1,0 +1,48 @@
+# Signal: Intraday Seasonality
+
+[metadata]
+name = "signal-intraday-seasonality"
+type = "signal"
+difficulty = "medium"
+tags = ["signal", "seasonality", "intraday", "time-of-day"]
+description = "Build signal from intraday time-of-day patterns"
+
+[resources]
+# Uses defaults from signal_shared.py
+
+[instruction]
+title = "Intraday Seasonality Signal"
+
+objective = """
+Build a signal exploiting **intraday seasonality patterns**. The hypothesis is that certain hours
+of the day exhibit predictable return patterns (e.g., Asian session open, US session close).
+
+Your goal: Identify time-of-day effects and build a signal that captures predictable intraday patterns.
+"""
+
+allowed_features = [
+    "close",
+    "volume",
+    "return",
+    "funding_rate",
+    "residual_return"
+]
+
+ideas = [
+        """
+    Finding a signal that works may require testing a bunch of variations: 
+     - think about what the data means and compare that with what empirical tests show: 
+        - What are the reputations for each group of traders? How does retail trading psychology play in here? How should the regions effect each other?
+        - Other features contextualize this: open interest, volume, trailing return, volatility
+        - Can we divide all the trading data into different trading sessions, then use those features to test other hypotheses for each market? 
+    - aggregating different sub-features into the signal with a rolling linear regression fit against no
+    - consider if this effect is a conditioner for a simple momentum, mean reversion or volume signal
+    - different normalizations of features both temporally (i.e time series z score) or cross-sectionally
+    """,
+    "Look for session effects (Asian, European, US)",
+    "Combine time-of-day with volume patterns",
+    "Use rolling statistics to adapt to changing seasonality",
+    "Consider day-of-week interactions with hour-of-day",
+    "Consider UTC timezone effects on session boundaries",
+    "Note that turnover may be an issue. If you are finding fitting to 1 period returns is too fast, calculate longer term forward returns and use that to fit any rolling fit signals. Make sure to correctly mask returns though. For example if your forward horizon is K, your rolling window for time T should end data at time T-K.",
+]

@@ -1,0 +1,135 @@
+[metadata]
+name = "signal-top-trader"
+type = "signal"
+difficulty = "hard"
+tags = ["signal", "top-trader", "positioning", "flow", "ml"]
+description = "Build signal from top trader positioning data"
+
+[resources]
+agent_timeout_sec = 1800.0
+memory_mb = 16384
+extra_pip_packages = ["scikit-learn>=1.4.0"]
+
+[instruction]
+title = "Top Trader Positioning Signal"
+
+objective = """
+Build a signal using Binance top trader positioning data.
+
+Top traders are identified by Binance as profitable traders. You have raw positioning
+metrics for top traders and retail "takers":
+- Top trader long/short ratios (sum and count aggregations)
+- Taker (retail) long/short volume ratios
+- Open interest values
+
+Your goal: Discover which features and transformations are predictive of future returns.
+Consider deriving new features, combining raw metrics, or applying ML techniques.
+"""
+
+allowed_features = [
+    "sum_toptrader_long_short_ratio",
+    "count_toptrader_long_short_ratio",
+    "sum_taker_long_short_vol_ratio",
+    "count_long_short_ratio",
+    "sum_open_interest",
+    "sum_open_interest_value",
+    "volume",
+    "close",
+]
+
+data_columns_extra_rows = """
+| `sum_toptrader_long_short_ratio` | Sum of top trader long/short ratios |
+| `count_toptrader_long_short_ratio` | Count-based top trader ratio |
+| `sum_taker_long_short_vol_ratio` | Taker (retail) long/short volume ratio |
+| `count_long_short_ratio` | Count-based long/short ratio |
+| `sum_open_interest` | Total open interest (contracts) |
+| `sum_open_interest_value` | Total open interest (notional USD) |
+"""
+
+ideas = [
+    """
+    Raw data handling and feature hygiene:
+    - Hourly positioning data may contain NaNs, discontinuities, or exchange-specific artifacts; explicitly handle missing values and verify alignment with price data.
+    - Forward-fill only where economically justified (e.g., open interest), and avoid filling directional ratios across long gaps.
+    - Clip extreme ratio values to reduce sensitivity to reporting glitches or thin markets.
+    """,
+
+    """
+    Relative positioning and divergence features:
+    - Compare top trader long/short ratios to taker (retail) long/short ratios; divergences may indicate smart-money vs crowd positioning.
+    - Construct spread features such as (top trader ratio – taker ratio) or normalized differences.
+    - Test whether extreme divergence predicts reversals (crowded trades) or continuation (informed positioning).
+    """,
+
+    """
+    Positioning level vs flow dynamics:
+    - Distinguish between positioning levels (absolute long/short ratios) and changes in positioning (flows).
+    - Compute rate of change, acceleration, and persistence of positioning shifts over multiple horizons.
+    - Hypothesis: rapid changes in top trader positioning may be more informative than static levels.
+    """,
+
+    """
+    Open interest and funding interactions:
+    - Combine positioning metrics with open interest changes to separate price moves driven by new risk-taking vs short covering / long liquidation.
+    - Test joint conditions (e.g., top traders increasing net longs while open interest rises).
+    - Normalize OI changes by recent volatility or average OI to ensure comparability across assets.
+    - also look at funding as a sign of market consensus crowding
+    """,
+
+    """
+    Cross-sectional normalization and ranking:
+    - Apply cross-sectional z-scores or ranks to positioning features to make signals comparable across tickers.
+    - Hypothesis: relative positioning within the cross-section is more informative than absolute levels.
+    - Test whether tails of the cross-sectional distribution carry most of the predictive power.
+    """,
+
+    """
+    Time-series normalization and regime sensitivity:
+    - Normalize positioning metrics by their own historical distributions (rolling z-scores, percentile ranks).
+    - Examine whether predictive power depends on volatility regime, trend regime, or funding conditions.
+    - Positioning signals may behave differently in trending vs mean-reverting markets.
+    """,
+
+    """
+    Asymmetry and nonlinear effects:
+    - Test whether long-side and short-side positioning have asymmetric predictive power.
+    - Explore nonlinear transformations (e.g., squared divergence, thresholds) to capture crowdedness effects.
+    - Hypothesis: extremely one-sided positioning may predict reversals, while moderate positioning predicts continuation.
+    """,
+
+    """
+    Market-wide vs asset-specific signals:
+    - Aggregate positioning across assets to build market-wide sentiment indicators.
+    - Condition individual asset signals on the state of aggregate top trader or retail positioning.
+    - Hypothesis: individual signals are stronger when aligned with or contrarian to market-wide positioning extremes.
+    """,
+
+    """
+    ML-assisted feature discovery:
+    - Use scikit-learn models (e.g., rolling regressions, tree-based models) to discover nonlinear interactions between positioning, OI, and returns.
+    - Treat ML outputs as feature generators or signal components rather than final black-box predictors.
+    - Regularize aggressively to avoid overfitting noisy high-frequency positioning data.
+    """,
+
+    """
+    Signal composition and ensembling:
+    - Combine multiple positioning-derived features (divergence, flow, OI interaction) into an ensemble signal.
+    - Evaluate whether ensembles improve stability and reduce drawdowns relative to single-feature signals.
+    - Allow different components to dominate under different market conditions.
+    """,
+
+    """
+    Diagnostics and falsification tests:
+    - Verify that apparent predictability is not driven by lookahead bias, data alignment errors, or overlapping returns.
+    - Check whether performance concentrates in a small subset of assets or time periods.
+    - Stress-test sensitivity to feature definitions, normalization windows, and clipping thresholds.
+    """,
+
+    """
+    Turnover and horizon alignment considerations:
+    - Monitor turnover explicitly; positioning signals can change rapidly and incur high trading costs.
+    - If fitting to 1-period-ahead returns is too noisy, calculate longer-horizon forward returns and use those as targets.
+    - When using a forward horizon of K, ensure all rolling features at time T only use data up to T−K to avoid leakage.
+    """
+]
+

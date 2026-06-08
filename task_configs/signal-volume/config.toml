@@ -1,0 +1,110 @@
+# Signal-Volume Task Configuration
+# Volume-based trading signal
+
+[metadata]
+name = "signal-volume"
+type = "signal"
+difficulty = "medium"
+tags = ["signal", "volume", "crypto", "ic"]
+description = "Create a volume-based trading signal with positive IC"
+
+[resources]
+# All defaults from signal_shared.py
+
+[instruction]
+title = "Volume Signal Task"
+
+allowed_features = [
+    "close",
+    "volume",
+    "return",
+    "funding_rate",
+    "residual_return",
+]
+
+objective = """
+Build a predictive signal for forward returns using volume-derived information (and its interaction with price and funding). The goal is to identify whether volume contains incremental information about future price movements beyond what is already reflected in recent returns.
+
+The core hypothesis is that volume proxies for the intensity and composition of trading: informed trading, retail attention shocks, liquidation/forced-flow events, and changes in risk appetite. Volume can therefore predict returns through multiple mechanisms:
+- Continuation: high volume confirms directional conviction and trend persistence.
+- Reversal: abnormal volume reflects exhaustion, forced unwinds, or temporary imbalances that subsequently mean-revert.
+- Regime dependence: the same volume pattern may imply different outcomes depending on volatility/trend state and funding conditions.
+
+This task should discover robust transformations of volume (levels, changes, anomalies, and nonlinear thresholds) and evaluate whether their predictive relationship with forward returns is stable out-of-sample and economically meaningful after accounting for turnover. Key failure modes include signals that simply proxy for volatility, rely on rare spikes, or collapse once normalized properly across assets and regimes.
+"""
+
+ideas = [
+    """
+    Relative volume / abnormal activity:
+    - Use relative volume = current volume divided by a rolling baseline (mean/median/EMA) to detect attention or activity shocks.
+    - Compare time-series z-scores, percentile ranks, and log-ratio transforms to stabilize heavy-tailed volume.
+    - Hypothesis: unusually high relative volume predicts either continuation (confirmation) or reversal (exhaustion), depending on context.
+    """,
+
+    """
+    Volume momentum vs volume mean reversion:
+    - Test whether sustained elevated volume over multiple bars predicts trend continuation (volume momentum).
+    - Test whether single-bar or short burst spikes predict reversal (exhaustion or liquidation flush).
+    - Separate “persistent high volume” from “transient spike” using multi-horizon features (level + change + persistence).
+    """,
+
+    """
+    Volume breakouts and threshold effects:
+    - Identify breakout events where volume exceeds a high percentile of its own history.
+    - Compare outcomes for moderate breakouts vs extreme blow-off tops (nonlinear response).
+    - Add post-spike decay features: how quickly volume normalizes may correlate with continuation strength.
+    """,
+
+    """
+    Price–volume confirmation and divergence:
+    - Combine return sign and relative volume: up move on high volume may be more persistent than up move on low volume.
+    - Look for divergence cases: price up on falling volume (potential weakening) or price down on rising volume (capitulation).
+    - Construct composite features like sign(return) * relative_volume or return / volume to capture “efficiency of price movement.”
+    """,
+
+    """
+    Funding rate interaction (positioning / leverage proxy):
+    - Condition volume signals on funding extremes: high volume when funding is very positive may indicate crowded long positioning and potential reversal risk.
+    - Conversely, high volume with very negative funding may indicate short crowding / squeeze potential.
+    - Use funding as a regime conditioner that flips the interpretation of volume spikes (informed flow vs forced flow).
+    """,
+
+    """
+    Flow vs noise decomposition:
+    - Use changes in volume (delta, pct change) and “volume acceleration” to identify sudden participation shifts.
+    - Hypothesis: changes in participation predict near-term return autocorrelation more than raw volume levels.
+    - Smooth volume features (EMA) and clip extreme values to reduce sensitivity to one-off prints.
+    """,
+
+    """
+    Cross-sectional comparability:
+    - Normalize volume features cross-sectionally (z-scores/ranks per timestamp) to compare signals across assets with different baseline liquidity.
+    - Hypothesis: “high relative volume compared to peers” captures market-wide attention allocation and may be more predictive than token-level anomalies alone.
+    """,
+
+    """
+    Regime conditioning and state dependence:
+    - Evaluate volume signals separately in trend vs range regimes (proxied by price momentum strength) and in high vs low volatility regimes (proxied by return dispersion).
+    - Hypothesis: volume confirms trends in trending regimes but marks exhaustion in choppy regimes.
+    - Implement conditioning via continuous scaling (weights) rather than hard filters where possible.
+    """,
+
+    """
+    Signal composability and ensembling:
+    - Combine multiple volume-derived components: anomaly (relative volume), persistence, breakout indicator, and price-volume divergence.
+    - Consider simple ensembles (weighted sums of ranks) to improve stability and reduce reliance on any single pattern.
+    - Measure overlap with momentum/reversal-only baselines to ensure incremental value from volume.
+    """,
+
+    """
+    Diagnostics, robustness, and falsification:
+    - Stress test lookbacks, normalization choices (log vs raw), clipping thresholds, and event definitions for breakouts.
+    - Verify the signal is not just a volatility proxy (since vol and volume co-move); test vol-adjusted versions implicitly via return scaling.
+    - Check concentration: whether PnL is driven by rare spikes vs frequent small edges.
+    """,
+
+    """
+    Note that turnover may be an issue. If you are finding fitting to 1 period returns is too fast, calculate longer term forward returns and use that to fit any rolling fit signals. Make sure to correctly mask returns though. For example if your forward horizon is K, your rolling window for time T should end data at time T-K.
+    """
+]
+

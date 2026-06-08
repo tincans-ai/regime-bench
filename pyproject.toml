@@ -1,0 +1,27 @@
+[project]
+name = "regime-bench"
+version = "0.1.1"
+description = "Benchmark for agent-built trading signals under market regime shift"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+dependencies = [
+  "numpy>=1.26",
+  "matplotlib>=3.8",
+  "polars>=1.0",
+  "pyarrow>=15.0",
+  "scipy>=1.11",
+  "statsmodels>=0.14",
+]
+
+[project.optional-dependencies]
+data = [
+  "huggingface-hub>=0.23",
+]
+test = [
+  "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

@@ -1,0 +1,45 @@
+# Signal-Beta Task Configuration
+# Low beta anomaly signal
+
+[metadata]
+name = "signal-beta"
+type = "signal"
+difficulty = "medium"
+tags = ["signal", "beta", "low-beta", "anomaly", "market-risk"]
+description = "Build low-beta anomaly signal - does it work in crypto?"
+
+[resources]
+# All defaults from signal_shared.py
+
+[instruction]
+title = "Low Beta Anomaly Signal Task"
+
+objective = """
+Build a signal exploiting the **low beta anomaly**. In equities, low-beta assets (less sensitive to market movements) tend to outperform high-beta assets on a risk-adjusted basis.
+**Research Question**: Does the low-beta anomaly exist in crypto markets
+In equities, the signal has the following direction:
+- **Long** low-beta assets (defensive, less market-sensitive)
+- **Short** high-beta assets (aggressive, highly market-sensitive)
+The hypothesis for why is that return-focused market participants will take lower sharpe as long there is higher return, so someone with access to leverage can exploit this.
+"""
+
+allowed_features = ["return", "residual_return", "close", "volume", "market_cap"]
+
+data_columns_extra_rows = """
+| `market_cap` | Daily market capitalization in USD (forward-filled to hourly) |
+"""
+
+ideas = [
+
+"""
+Data to use: residual returns already have market returns removed from them, so shouldnt be used. 
+Finding a signal that works may require testing a bunch of variations: 
+- use different returns to calculate betas 
+- use different windows / time weighting schemes to calculate betas (ema, rolling window)
+- clip returns or normalize them somehow
+- consider if the premium changes based on the peformance of the market (ie high betas coins perform better in bull markets and worse in bear markets)
+- consider if this effect is a conditioner for a simple mean reversion or volume Signal
+- different normalizations of the signal both temporally (i.e time series z score) or cross-sectionally
+""",
+    "Note that turnover may be an issue. If you are finding fitting to 1 period returns is too fast, calculate longer term forward returns and use that to fit any rolling fit signals. Make sure to correctly mask returns though. For example if your forward horizon is K, your rolling window for time T should end data at time T-K.",
+]

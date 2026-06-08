@@ -1,0 +1,80 @@
+# Signal: Mean Reversion and Momentum Conditioned by Volume and Volatility
+
+[metadata]
+name = "signal-momentum-conditioned"
+type = "signal"
+difficulty = "hard"
+tags = ["signal", "momentum", "mean-reversion", "volume", "volatility", "conditional"]
+description = "Build signal combining momentum and mean reversion conditioned on volume/volatility"
+
+[resources]
+agent_timeout_sec = 1800.0
+memory_mb = 16384
+
+[instruction]
+title = "Conditioned Momentum/Mean-Reversion Signal"
+
+allowed_features = [
+    "close",
+    "volume",
+    "return",
+    "funding_rate",
+    "residual_return",
+]
+
+objective = """
+Evaluate whether **time-series trend-following (momentum)** constitutes a robust and economically meaningful anomaly in cryptocurrency markets, analogous to the well-documented trend premium in traditional asset classes. The research question is whether sustained price trends in crypto—driven by slow information diffusion, investor herding, and reflexive flows—can be systematically captured using simple breakout-based rules, and whether these effects persist after accounting for volatility, transaction costs, and dynamic universe selection.
+
+The hypothesized direction is:
+- **Long** assets exhibiting positive price trends or upside breakouts
+- **Flat / Short** assets that exit trends or experience downside breakouts (depending on long-only vs long-short design)
+
+The target is raw return, not residual, so you are able to take market risk. 
+The economic intuition is primarily behavioral and structural rather than fundamental: crypto markets are characterized by high retail participation, limited valuation anchors, reflexive narratives, and flow-driven dynamics, all of which can generate persistent trends. Trend-following may therefore serve both as a return-generating anomaly and as a risk-management overlay, particularly in mitigating large drawdowns relative to passive exposure.
+"""
+
+ideas = [
+"""
+Signal construction:
+- Implement breakout-based trend signals
+- use various normalizations and residualizations of returns (raw and r esidual) to assess trend 
+- Test a wide range of lookback horizons (short-term to long-term) to capture different trend regimes
+- Compare binary signals (in/out of trend) vs continuous trend strength measures
+- Explore ensemble constructions that average or weight signals across multiple horizons
+Normalization and scaling:
+- Volatility targeting to stabilize risk across assets and time
+- Cap leverage or exposure to prevent over-allocation during low-volatility regimes
+- Compare volatility-scaled position sizing vs equal-weight or notional sizing
+- Test alternative volatility estimators (rolling std, EWMA, Parkinson, etc.)
+
+Conditioning and regimes:
+- Examine performance conditional on market regimes (bull, bear, sideways)
+- Test whether trend-following performs differently during high-volatility expansions vs contractions
+- Condition trend signals on market-level trend (e.g., Bitcoin regime filter)
+- Explore whether trend strength decays or accelerates as participation broadens
+
+Overlap and combination ideas:
+- Analyze overlap with cross-sectional momentum and factor momentum
+- Combine trend-following with mean reversion signals as a regime switcher
+- Use trend signals as a risk-on / risk-off overlay for other alpha strategies
+- Investigate interactions with liquidity, volume surges, or volatility clustering
+
+Universe selection and portfolio construction:
+- Dynamic universe selection based on liquidity, volume, and trading activity
+- Compare fixed-universe vs rotating-universe implementations
+- Test sensitivity to breadth (number of assets) and concentration
+- Explore cross-sectional diversification benefits vs idiosyncratic trend capture
+
+Noise reduction and data cleaning:
+- Exclude assets with insufficient trading history or stale prices
+- Filter out extreme illiquidity, manipulated tokens, or low-activity regimes
+- Smooth signals to reduce churn (e.g., confirmation periods, rebalance thresholds)
+- Explicitly account for transaction costs, slippage, and turnover
+
+Failure modes and robustness:
+- Identify environments where trend-following fails (choppy, mean-reverting markets)
+- Test decay as crypto markets institutionalize and become more efficient
+""",
+    "Note that turnover may be an issue. If you are finding fitting to 1 period returns is too fast, calculate longer term forward returns and use that to fit any rolling fit signals. Make sure to correctly mask returns though. For example if your forward horizon is K, your rolling window for time T should end data at time T-K.",
+]
+eval_return_column = "return"  # For tasks judged on raw returns

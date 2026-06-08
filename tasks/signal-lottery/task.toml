@@ -1,0 +1,39 @@
+version = "1.0"
+
+[metadata]
+author_name = "Alpha Team"
+author_email = "team@alpha.ai"
+difficulty = "medium"
+category = "quant-research"
+tags = ["signal", "volatility", "lottery", "behavioral", "retail"]
+description = "Build lottery effect signal - short high-vol coins with recent positive jumps"
+
+[verifier]
+timeout_sec = 300.0
+
+[agent]
+timeout_sec = 1800.0
+
+[environment]
+build_timeout_sec = 600.0
+cpus = 4
+memory_mb = 8192
+storage_mb = 20480
+gpus = 0
+
+[verifier.env]
+GEMINI_API_KEY = "${GEMINI_API_KEY}"
+
+[checker]
+enabled = true
+timeout_sec = 60.0
+max_checks = 10
+cooldown_sec = 5.0
+
+[checker.env]
+# No GEMINI_API_KEY needed - checker doesn't use LLM judge
+
+[artifacts]
+# Copy plots and results from /logs/artifacts to job folder
+paths = ["/logs/artifacts"]
+

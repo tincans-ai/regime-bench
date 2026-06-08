@@ -1,0 +1,39 @@
+version = "1.0"
+
+[metadata]
+author_name = "{{ metadata.author_name | default('Alpha Team') }}"
+author_email = "{{ metadata.author_email | default('team@alpha.ai') }}"
+difficulty = "{{ metadata.difficulty }}"
+category = "{{ metadata.category | default('quant-research') }}"
+tags = {{ metadata.tags | tojson }}
+description = "{{ metadata.description }}"
+
+[verifier]
+timeout_sec = {{ resources.verifier_timeout_sec | default(600.0) }}
+
+[agent]
+timeout_sec = {{ resources.agent_timeout_sec | default(1800.0) }}
+
+[environment]
+build_timeout_sec = {{ resources.build_timeout_sec | default(600.0) }}
+cpus = {{ resources.cpus | default(2) }}
+memory_mb = {{ resources.memory_mb | default(4096) }}
+storage_mb = {{ resources.storage_mb | default(20480) }}
+gpus = {{ resources.gpus | default(0) }}
+
+[verifier.env]
+GEMINI_API_KEY = "${GEMINI_API_KEY}"
+
+[checker]
+enabled = true
+timeout_sec = {{ resources.checker_timeout_sec | default(60.0) }}
+max_checks = {{ resources.max_checks | default(10) }}
+cooldown_sec = {{ resources.checker_cooldown_sec | default(5.0) }}
+
+[checker.env]
+# No GEMINI_API_KEY needed - checker doesn't use LLM judge
+
+[artifacts]
+# Copy plots and results from /logs/artifacts to job folder
+paths = ["/logs/artifacts"]
+

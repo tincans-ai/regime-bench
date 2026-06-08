@@ -1,0 +1,104 @@
+# Signal: Mean Reversion
+
+[metadata]
+name = "signal-mean-reversion"
+type = "signal"
+difficulty = "medium"
+tags = ["signal", "mean-reversion", "contrarian", "zscore"]
+description = "Build classic mean reversion signal"
+
+[resources]
+# Uses defaults from signal_shared.py
+
+[instruction]
+title = "Mean Reversion Signal"
+
+objective = """
+Build a **classic mean reversion signal**. The hypothesis is that prices/returns tend to
+revert to their mean, so extreme moves in one direction predict subsequent moves in the
+opposite direction.
+
+Approaches:
+- Z-score of recent returns → fade extremes
+- Bollinger band deviation
+- RSI-style overbought/oversold indicators
+- Distance from moving average
+
+Your goal: Build a signal that identifies overextended moves likely to reverse.
+"""
+
+allowed_features = [
+    "close",
+    "volume",
+    "return",
+    "residual_return",
+]
+
+ideas = [
+"""
+Residuals and alternative decompositions:
+- Start from existing residual series and evaluate their mean-reversion properties directly
+- Remain open to re-decomposing raw returns if residuals show poor or unstable behavior
+- Compare alternative decompositions of returns:
+  - PCA or statistical factor models
+  - Market/sector regression residuals
+  - Volatility-scaled or beta-neutralized returns
+  - Volume-weighted or liquidity-adjusted return decompositions
+- Test whether different decompositions produce residuals with more stable mean-reversion dynamics
+
+Mean-reversion estimation:
+- Model residuals (or transformed returns) using OU / AR(1)-style processes
+- Estimate mean-reversion speed and implied mean-reversion time per asset
+- Rank assets cross-sectionally by estimated mean-reversion speed
+- Test multiple estimation schemes:
+  - Rolling vs expanding windows
+  - Equal-weighted vs exponentially weighted estimators
+  - Robust or bias-aware estimators
+- Normalize mean-reversion speed by residual volatility or volume-adjusted volatility
+
+Signal construction:
+- Core signal: trade standardized residual (or transformed-return) level conditional on fast mean reversion
+- Compare threshold-based entry/exit rules vs continuous position sizing
+- Test symmetric vs asymmetric thresholds for long and short positions
+- Examine whether faster mean-reverting assets support tighter entry bands or faster turnover
+- normalization with time series or cross-sectional z-scores 
+
+Volume and liquidity conditioning:
+- Condition signals on contemporaneous and lagged volume
+- Test whether mean-reversion is stronger following volume spikes or volume droughts
+- Use volume to filter illiquid or noisy residuals
+- Explore volume-weighted signal scaling or position sizing
+- Interact volume with mean-reversion speed as a joint reliability measure
+
+Normalization and scaling:
+- Time-series normalize signals per asset (z-scores, volatility scaling)
+- Cross-sectionally rank signals within the fast–mean-reversion universe
+- Scale positions by volatility and/or volume to equalize risk and execution impact
+- Cap exposures to avoid domination by extreme residual or volume effects
+
+Regime dependence:
+- Study how mean-reversion speed changes across market regimes
+- Test whether residuals become more trending during high-volatility or stress periods
+- Condition trading on aggregate residual behavior (e.g., market-wide mean-reversion proxy)
+- Explore regime switches that disable or downweight mean-reversion trades when convergence slows
+
+Overlap and combination ideas:
+- Treat mean-reversion-speed ranking as a filter or conditioner, not a standalone alpha
+- Combine with classic pairs trading, basket mean reversion, or relative-value signals
+- Use fast mean-reversion residuals as inputs to market-neutral carry or funding strategies
+- Investigate overlap with liquidity, volume, and volatility-driven effects
+
+Noise reduction and data cleaning:
+- Exclude assets with insufficient history or persistently low volume
+- Clip or winsorize extreme residuals and returns before estimation
+- Stabilize mean-reversion estimates by bounding implausible values
+- Handle missing or stale data carefully to avoid artificial persistence
+
+Failure modes and robustness:
+- Test sensitivity to decomposition choice, window length
+- Analyze drawdowns driven by regime shifts in residual behavior
+- Examine whether slow mean-reversion assets dominate losses
+- Stress-test performance during prolonged trending or volume-driven markets
+""",
+    "Note that turnover may be an issue. If you are finding fitting to 1 period returns is too fast, calculate longer term forward returns and use that to fit any rolling fit signals. Make sure to correctly mask returns though. For example if your forward horizon is K, your rolling window for time T should end data at time T-K.",
+]

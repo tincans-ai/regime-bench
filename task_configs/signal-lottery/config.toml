@@ -1,0 +1,72 @@
+# Signal-Lottery Task Configuration
+# Lottery effect signal - high volatility + positive jumps underperform
+
+[metadata]
+name = "signal-lottery"
+type = "signal"
+difficulty = "medium"
+tags = ["signal", "volatility", "lottery", "behavioral", "retail"]
+description = "Build lottery effect signal - short high-vol coins with recent positive jumps"
+
+[resources]
+# All defaults from signal_shared.py
+
+[instruction]
+title = "Lottery Effect Signal Task"
+
+
+objective = """
+Test whether a **lottery-like anomaly** exists in cryptocurrency markets, where assets with recent extreme positive payoffs earn lower subsequent returns due to investor preference for skewed, jackpot-like outcomes. Building on the MAX-based lottery framework from equity markets and recent crypto evidence, the core research question is whether cryptocurrencies exhibiting high recent extreme returns are systematically overvalued by return-seeking, skewness-loving investors, leading to predictable underperformance going forward.
+
+The hypothesized direction is:
+- **Short** cryptocurrencies with high lottery-like characteristics (e.g., large recent maximum daily returns)
+- **Long** cryptocurrencies with low lottery-like characteristics
+
+The economic intuition is behavioral rather than risk-based: investors with lottery preferences overweight small-probability, large-payoff outcomes and are willing to accept lower expected returns or Sharpe ratios in exchange for positive skewness. This effect may be amplified in crypto due to retail dominance, high volatility, and limited constraints on speculative demand, but may vary across market regimes and horizons.
+"""
+
+allowed_features = ["return", "close", "volume", "residual_return"]
+
+ideas = [
+"""
+Signal construction:
+- Replicate MAX-style measures using different definitions of lottery-like payoff:
+  - Maximum daily return over the past N days
+  - Average of top K daily returns (e.g., MAX3, MAX5, MAX10)
+  - Percentile-based extreme return (e.g., 99th percentile daily return)
+- Test different lookback windows (1 week, 2 weeks, 1 month, multi-month aggregation)
+- Compare raw returns vs log returns, and clipped vs unclipped returns when computing extremes
+- Explore whether downside extremes (min returns) matter asymmetrically vs upside-only measures
+
+Normalization and scaling:
+- Cross-sectional ranking of lottery measures each period (quintiles, deciles)
+- Cross-sectional z-scores vs rank transforms to reduce sensitivity to outliers
+- Time-series normalization of the lottery measure (rolling z-score relative to asset’s own history)
+- Volatility-scaled MAX measures (extreme return divided by recent volatility)
+
+Conditioning and regimes:
+- Test whether the lottery effect strengthens or weakens in bull vs bear markets
+- Condition on market trend, market volatility, or aggregate crypto returns
+- Examine whether high-MAX assets briefly outperform in strong momentum regimes before reversing
+- Test horizon dependence: short-term (1 week) vs medium-term (1–3 months) vs long-term (6–12 months)
+
+Overlap and combination ideas:
+- Study overlap with momentum: extreme positive returns may proxy for short-term momentum that subsequently reverses
+- Combine with mean reversion signals (e.g., lottery-like as a conditioner for reversal)
+- Interact lottery measures with volume or turnover to distinguish speculative demand from information-driven moves
+- Use lottery signal as a weighting or risk-scaling overlay rather than a standalone alpha
+
+Noise reduction and data cleaning:
+- Winsorize or clip extreme daily returns used to compute MAX to reduce microstructure noise
+- Exclude assets with insufficient trading history or stale prices
+- Handle illiquid or low market-cap assets carefully to avoid spurious extreme returns
+- Forward-fill checks for market cap and volume to avoid artificial jumps
+
+Failure modes and robustness:
+- Test robustness controlling for size, beta, volatility, skewness, and momentum
+- Examine whether the effect decays in more institutionalized periods of the crypto market
+- Check if the anomaly is driven by microcaps or survives liquidity and capacity constraints
+- Evaluate whether the signal inverts during speculative bubbles when lottery demand dominates fundamentals
+""",
+    "Note that turnover may be an issue. If you are finding fitting to 1 period returns is too fast, calculate longer term forward returns and use that to fit any rolling fit signals. Make sure to correctly mask returns though. For example if your forward horizon is K, your rolling window for time T should end data at time T-K.",
+]

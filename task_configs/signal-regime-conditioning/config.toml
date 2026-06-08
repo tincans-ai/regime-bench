@@ -1,0 +1,122 @@
+# Signal: Regime Conditioning of Momentum and Mean Reversion
+
+[metadata]
+name = "signal-regime-conditioning"
+type = "signal"
+difficulty = "hard"
+tags = ["signal", "regime", "momentum", "mean-reversion", "adaptive"]
+description = "Build signal that switches between momentum and mean reversion based on market regime"
+
+[resources]
+agent_timeout_sec = 1800.0
+memory_mb = 16384
+extra_pip_packages = ["scikit-learn>=1.4.0"]
+
+[instruction]
+title = "Regime-Conditioned Momentum/Mean-Reversion Signal"
+
+objective = """
+Build a signal that **adaptively switches between momentum and mean reversion** based on detected market regime.
+
+The hypothesis:
+- In trending regimes → momentum works (follow the trend)
+- In ranging/volatile regimes → mean reversion works (fade extremes)
+
+Your goal: Detect market regime and blend momentum vs mean reversion signals accordingly.
+"""
+
+allowed_features = [
+    "close",
+    "volume",
+    "return",
+    "funding_rate",
+    "residual_return",
+]
+
+ideas = [
+    """
+    Regime detection:
+    - Hypothesis: high-volatility regimes favor mean reversion due to forced deleveraging, liquidation cascades, and short-term overreaction, while low-volatility regimes favor momentum due to gradual information diffusion.
+    - Define volatility regimes using rolling realized volatility, range-based measures, or volatility-of-volatility.
+    - Test hard regime splits vs smooth transitions (continuous regime scores).
+    - Also look at using market-wide returns or volume profiles 
+    """,
+
+    """
+    Hidden Markov Models and latent regime structure:
+    - Use HMM-style regime inference to identify latent market states (e.g., trending, mean-reverting, chaotic).
+    - Compare regimes inferred from market-level returns vs cross-sectional dispersion vs volatility dynamics.
+    - Evaluate regime persistence and transition probabilities to assess trade stability and turnover risk.
+    - can also just use simpler continous scores
+    """,
+
+    """
+    Trend vs range detection via correlation structure:
+    - Use rolling autocorrelation of returns or rolling correlation with lagged market returns to distinguish trending vs ranging behavior.
+    - Hypothesis: rising positive autocorrelation indicates momentum-dominated regimes, while near-zero or negative autocorrelation favors reversion.
+    - Examine whether correlation signals are more informative at the market level or asset-specific level.
+    """,
+
+    """
+    Trend strength indicators (ADX-like logic):
+    - Construct ADX-style measures using directional movement, range expansion, or cumulative return consistency.
+    - Compare classical technical definitions vs statistically motivated variants (e.g., signal-to-noise ratios of returns).
+    - Use trend strength as a continuous conditioner rather than a binary filter.
+    """,
+
+    """
+    Regime-dependent blending of signals:
+    - Combine momentum and mean reversion signals using weights that depend on inferred regime probabilities.
+    - Test linear blends vs nonlinear gating (e.g., only activate MR above a volatility threshold).
+    - Evaluate whether blended signals reduce drawdowns relative to pure momentum or pure MR strategies.
+    """,
+
+    """
+    Market-wide vs asset-specific conditioning:
+    - Use market-level regime indicators to gate or scale individual asset signals.
+    - Hypothesis: individual asset momentum is more reliable when the broader market exhibits coherent trends.
+    - Compare conditioning on global market signals vs sector/cluster-level aggregates.
+    """,
+
+    """
+    Momentum signal variants:
+    - Define momentum using different horizons (short-term, intermediate-term) and return transformations (raw, volatility-scaled).
+    - Test whether momentum strength depends on recent volatility contraction or expansion.
+    - Examine cross-sectional vs time-series momentum formulations under different regimes.
+    """,
+
+    """
+    Mean reversion signal variants:
+    - Define MR using extreme return thresholds, distance from rolling mean, or rank-based deviations.
+    - Compare fast MR (1–5 bars) vs slow MR (multi-day) and their interaction with volatility regimes.
+    - Test asymmetric behavior: downside shocks may revert differently than upside spikes.
+    """,
+
+    """
+    ML-assisted regime detection:
+    - Use scikit-learn–available models (e.g., clustering, PCA on market features) to infer regime states without labels.
+    - Compare ML-derived regimes to hand-crafted indicators for interpretability and stability.
+    - Treat ML regimes as soft conditioners rather than direct trade signals.
+    """,
+
+    """
+    Turnover and horizon alignment considerations:
+    - Monitor turnover explicitly; high-frequency regime switching may erase alpha after costs.
+    - If 1-period-ahead prediction is too noisy, fit signals on longer-horizon forward returns.
+    - When using a forward horizon of K, ensure all rolling features at time T only use data up to T−K to avoid leakage.
+    """,
+
+    """
+    Signal smoothing and noise reduction:
+    - Apply temporal smoothing (EMA, rolling averages) to regime probabilities and signal weights to reduce churn.
+    - Clip or winsorize extreme feature values that can cause spurious regime flips.
+    - Require minimum regime confidence before activating aggressive signal weights.
+    """,
+
+    """
+    Diagnostics and overlap analysis:
+    - Measure how often regime logic simply reproduces volatility timing or beta exposure.
+    - Test whether regime-conditioned signals add incremental value beyond unconditional momentum or MR.
+    - Evaluate robustness by perturbing thresholds, lookbacks, and regime definitions.
+    """
+]

@@ -1,0 +1,25 @@
+services:
+  main:
+    build:
+      context: ${CONTEXT_DIR}
+    image: ${MAIN_IMAGE_NAME}
+    command: [ "sh", "-c", "sleep infinity" ]
+    network_mode: ${NETWORK_MODE:-bridge}
+    environment:
+      - TEST_DIR=${TEST_DIR}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - MAX_VAL_CHECKS=${MAX_VAL_CHECKS:-1}
+      - DEBUG_MODE=${DEBUG_MODE:-}
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ${HOST_VERIFIER_LOGS_PATH}:${ENV_VERIFIER_LOGS_PATH}
+      - ${HOST_AGENT_LOGS_PATH}:${ENV_AGENT_LOGS_PATH}
+      - ${HOST_CHECKER_LOGS_PATH}:${ENV_CHECKER_LOGS_PATH}
+      - ${HOST_OUTPUT_PATH:-/tmp/harbor_output}:/app/output
+      - ${HOST_ARTIFACTS_PATH:-/tmp/harbor_artifacts}:/logs/artifacts
+      - ${HOST_TESTS_PATH:-../tests_agent}:/tests
+    deploy:
+      resources:
+        limits:
+          cpus: ${CPUS}
+          memory: ${MEMORY}

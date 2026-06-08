@@ -1,0 +1,119 @@
+# Signal: Weekly / Monthly Seasonality
+
+[metadata]
+name = "signal-weekly-seasonality"
+type = "signal"
+difficulty = "medium"
+tags = ["signal", "seasonality", "weekly", "monthly", "calendar"]
+description = "Build signal from weekly and monthly calendar effects"
+
+[resources]
+# Uses defaults from signal_shared.py
+
+[instruction]
+title = "Weekly/Monthly Seasonality Signal"
+
+allowed_features = [
+    "close",
+    "volume",
+    "return",
+    "funding_rate",
+    "residual_return",
+]
+
+objective = """
+Build a predictive signal that exploits calendar-based seasonality in returns, focusing on weekly and monthly timing effects. The core hypothesis is that recurring institutional, retail, and mechanical flows (rebalancing, settlement cycles, options expiry, funding resets, and behavioral routines) create predictable return patterns tied to the calendar rather than asset-specific fundamentals.
+
+In crypto, these effects may arise from:
+- Weekend vs weekday participation differences (retail vs institutional dominance),
+- Month-end and month-start portfolio rebalancing and capital flows,
+- Options expiry and derivatives-related positioning adjustments,
+- Periodic funding rate resets and leverage management.
+
+The research goal is to identify which calendar effects are statistically and economically meaningful out-of-sample, whether they persist or decay over time, and how they interact with volume and funding conditions. The signal should capture calendar-driven predictability in forward returns while avoiding overfitting to fixed historical averages or regime-specific artifacts.
+
+Key failure modes include effects that disappear after rolling estimation, signals that are purely time-series (market timing) rather than cross-sectional, and patterns that collapse once turnover and transaction costs are considered.
+"""
+
+ideas = [
+    """
+    Day-of-week seasonality:
+    - Compute average and conditional returns by day-of-week (e.g., Monday vs Friday).
+    - Hypothesis: weekends and early-week periods reflect different participant mixes and risk appetites.
+    - Test whether effects are symmetric (all Mondays) or concentrated in specific regimes (bull vs bear).
+    """,
+
+    """
+    Month-end / month-start effects:
+    - Compare returns in the last N days of the month vs the first N days of the next month.
+    - Hypothesis: rebalancing, cash deployment, and reporting cycles create predictable pressure.
+    - Test multiple definitions (last 1, 3, 5 days) and avoid anchoring to a single cutoff.
+    """,
+
+    """
+    Options expiry and derivatives calendar:
+    - Identify monthly and quarterly options expiry dates and examine pre- and post-expiry returns.
+    - Hypothesis: dealer hedging, gamma effects, and position roll-offs distort prices around expiry.
+    - Compare expiry effects in high open-interest months vs low OI months using volume/funding as proxies.
+    """,
+
+    """
+    Rolling estimation of seasonality:
+    - Estimate calendar effects using rolling windows to allow patterns to evolve or decay.
+    - Compare expanding vs rolling windows to distinguish structural effects from transient ones.
+    - Penalize or downweight calendar effects that are unstable through time.
+    """,
+
+    """
+    Cross-sectional calendar effects:
+    - Normalize calendar returns cross-sectionally (z-scores or ranks per timestamp) to build relative signals.
+    - Hypothesis: even if the market as a whole has a weak calendar effect, certain assets may consistently outperform peers on specific dates.
+    - Test whether effects concentrate in specific liquidity or market-cap cohorts.
+    """,
+
+    """
+    Interaction with volume and participation:
+    - Condition calendar effects on volume anomalies: calendar signals may only matter when participation is elevated or suppressed.
+    - Hypothesis: month-end effects with high volume differ from those with thin participation.
+    - Use volume as a reliability filter rather than a direct predictor.
+    """,
+
+    """
+    Interaction with funding rates and leverage:
+    - Condition calendar signals on funding rate levels and changes.
+    - Hypothesis: weekend or expiry effects may flip sign when funding is extremely positive or negative due to crowded positioning.
+    - Test whether funding acts as an amplifier or canceller of calendar seasonality.
+    """,
+
+    """
+    Weekly–monthly interaction effects:
+    - Combine day-of-week and day-of-month indicators (e.g., Monday that is also month-start).
+    - Hypothesis: overlapping calendar events produce stronger effects than either alone.
+    - Evaluate whether interactions add signal or simply overfit noise.
+    """,
+
+    """
+    Calendar dummy vs continuous encoding:
+    - Compare discrete dummy variables (e.g., is_month_end) to continuous encodings (distance to month-end, sine/cosine seasonality).
+    - Continuous encodings may capture smoother anticipation effects rather than sharp date boundaries.
+    """,
+
+    """
+    Signal composability and portfolio usage:
+    - Treat calendar effects as timing overlays or alpha tilts rather than standalone strategies.
+    - Combine calendar signals with cross-sectional factors (momentum, value proxies) to test incremental value.
+    - Measure overlap to ensure calendar effects are not redundant with existing signals.
+    """,
+
+    """
+    Robustness and multiple-testing discipline:
+    - Correct for data-snooping risk given many possible calendar partitions.
+    - Require economic plausibility and persistence across subperiods.
+    - Stress test by shifting calendar definitions slightly (±1 day) to ensure effects are not knife-edge.
+    """,
+
+    """
+    Note that turnover may be an issue. If you are finding fitting to 1 period returns is too fast, calculate longer term forward returns and use that to fit any rolling fit signals. Make sure to correctly mask returns though. For example if your forward horizon is K, your rolling window for time T should end data at time T-K.
+    """
+]
+

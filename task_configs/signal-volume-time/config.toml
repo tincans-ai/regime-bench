@@ -1,0 +1,113 @@
+# Signal: Volume-Time
+
+[metadata]
+name = "signal-volume-time"
+type = "signal"
+difficulty = "medium"
+tags = ["signal", "volume", "time", "microstructure"]
+description = "Build signal from volume-time relationship (volume clock)"
+
+[resources]
+# Uses defaults from signal_shared.py
+
+[instruction]
+title = "Volume-Time Signal"
+
+allowed_features = [
+    "close",
+    "volume",
+    "return",
+    "funding_rate",
+    "residual_return",
+]
+
+objective = """
+Build a predictive signal from the volume–time relationship: not just how much volume trades, but how quickly it accumulates and how that rate changes. The key hypothesis is that the “volume clock” (time measured in traded volume units) captures shifts in participation and urgency that precede price moves.
+
+Economically and microstructurally, rapid volume accumulation can indicate informed trading, attention shocks, or forced flows (liquidations), while unusually slow volume can reflect lack of conviction, fragile price moves, or pending regime changes. Changes in volume velocity and acceleration may therefore predict whether price action will continue, reverse, or transition into a new state.
+
+This task aims to transform raw volume and price into features that measure (i) volume velocity, (ii) volume acceleration/deceleration, and (iii) deviations from expected intraday accumulation patterns, and to test whether these features forecast forward returns in a robust, out-of-sample manner. Key failure modes include signals that collapse into simple volatility proxies, are dominated by rare spikes, or rely on unstable time-of-day artifacts rather than persistent participation dynamics.
+"""
+
+ideas = [
+    """
+    Volume clock / cumulative volume dynamics:
+    - Work in cumulative volume space to measure how “fast the market is trading” independent of calendar time.
+    - Compute volume velocity as the first difference of cumulative volume (and its rolling normalization).
+    - Hypothesis: bursts in the volume clock correspond to participation shocks that can precede directional moves.
+    """,
+
+    """
+    Volume acceleration and deceleration:
+    - Use second differences of cumulative volume (acceleration) to detect ramping participation vs fading interest.
+    - Hypothesis: accelerating volume during price trends confirms continuation; accelerating volume after sharp moves may indicate exhaustion/turning points.
+    - Compare acceleration computed on raw volume vs log(volume + 1) to reduce heavy-tail dominance.
+    """,
+
+    """
+    Abnormal volume relative to expected patterns:
+    - Define expected volume based on recent history and/or time-of-day baselines; signal is deviation from expectation.
+    - Use rolling percentiles, rolling z-scores, or percentile-of-hour features (e.g., current hour volume relative to same-hour history).
+    - Hypothesis: abnormal positive deviations indicate attention/information shocks; abnormal negative deviations indicate low conviction / fragile moves.
+    """,
+
+    """
+    Multi-horizon structure (fast vs slow participation):
+    - Construct fast and slow measures of volume velocity/acceleration and take their spread (fast minus slow).
+    - Hypothesis: when fast participation ramps above slow baseline, short-horizon predictability increases.
+    - Evaluate whether the signal is best at predicting very short horizon returns or slightly longer horizons (to avoid microstructure noise).
+    """,
+
+    """
+    Price confirmation vs divergence under volume-time signals:
+    - Combine return sign with volume velocity/acceleration: price up + accelerating volume may imply continuation; price up + decelerating volume may imply weakening.
+    - Build divergence features such as (return strength) vs (participation strength) to detect “price moving without participation.”
+    - Hypothesis: divergence predicts reversal or increased volatility rather than continuation.
+    """,
+
+    """
+    VWAP-style deviations using available features:
+    - Approximate VWAP dynamics from close and volume by constructing volume-weighted price proxies over rolling windows.
+    - Use deviations of price from rolling volume-weighted price as a “who is in control” measure (price above/below VWAP under rising participation).
+    - Hypothesis: persistent deviation with rising volume clock indicates informed directional flow.
+    """,
+
+    """
+    Volume bursts as event signals:
+    - Detect burst events (volume velocity above a high percentile) and measure post-event drift vs reversal.
+    - Separate single-bar bursts from sustained bursts (burst persistence) since they may imply different mechanisms (liquidation spike vs trend ignition).
+    - Apply clipping/winsorization to prevent single extreme prints from dominating features.
+    """,
+
+    """
+    Normalization and comparability:
+    - Use time-series normalization (rolling z-score, rolling percentile) for each asset to stabilize volume features.
+    - Consider cross-sectional ranking of “participation shocks” per timestamp to identify which assets are receiving disproportionate attention.
+    - Log-transform volume features to reduce scale effects and heavy tails.
+    """,
+
+    """
+    Participation-state regimes:
+    - Define regimes based on participation intensity (high vs low volume-clock speed) and test whether return predictability changes by regime.
+    - Hypothesis: momentum effects may strengthen when participation is rising; mean reversion may dominate after extreme participation spikes.
+    - Use regime as a conditioner for signal strength rather than a hard filter where possible.
+    """,
+
+    """
+    Noise reduction and data quality:
+    - Handle missing volume prints explicitly; avoid forward-filling where it creates artificial smoothness in velocity/acceleration.
+    - Clip implausible spikes and verify that volume units are consistent over time.
+    - Smooth velocity/acceleration estimates (EMA) to reduce churn and stabilize inference.
+    """,
+
+    """
+    Diagnostics and falsification:
+    - Check whether performance is merely capturing volatility (since vol and volume often co-move); compare to volatility-scaled variants implicitly via return normalization.
+    - Test stability across lookbacks, clipping thresholds, and time-of-day adjustments; robust effects should degrade smoothly.
+    - Verify signal is not an artifact of overlapping windows or leakage from forward return construction.
+    """,
+
+    """
+    Note that turnover may be an issue. If you are finding fitting to 1 period returns is too fast, calculate longer term forward returns and use that to fit any rolling fit signals. Make sure to correctly mask returns though. For example if your forward horizon is K, your rolling window for time T should end data at time T-K.
+    """
+]

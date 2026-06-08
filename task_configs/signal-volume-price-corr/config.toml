@@ -1,0 +1,120 @@
+# Signal-Volume-Price-Corr Task Configuration
+# Price-volume correlation signal
+
+[metadata]
+name = "signal-volume-price-corr"
+type = "signal"
+difficulty = "medium"
+tags = ["signal", "volume", "price", "correlation", "technical"]
+description = "Build signal from price-volume correlation dynamics"
+
+[resources]
+# All defaults from signal_shared.py
+
+[instruction]
+title = "Price-Volume Correlation Signal Task"
+
+allowed_features = [
+    "close",
+    "volume",
+    "return",
+    "funding_rate",
+    "residual_return",
+]
+
+objective = """
+Build a predictive signal from the relationship between price changes and trading volume. The goal is to test whether the strength, sign, and stability of price–volume linkage contains information about future returns, beyond what is captured by price-only or volume-only signals.
+
+The core hypothesis is microstructural and behavioral: in healthy trending markets, price moves tend to be “confirmed” by volume (participation and conviction), while weak or manipulated markets can exhibit price changes that are poorly supported by genuine volume. Additionally, shifts in the price–volume relationship may indicate regime transitions (trend formation, exhaustion, or reversal).
+
+This task evaluates three questions:
+1) Does high price–volume correlation predict continuation (trend persistence)?
+2) Does low or negative correlation predict reversal or underperformance (weak conviction, noisy prints, potential wash-trading-like behavior)?
+3) Do changes in correlation act as early warnings of regime shifts and trend reversals?
+
+The signal should extract robust features from rolling/EWM estimates of price–volume coupling, be evaluated cross-sectionally and over time, and remain stable out-of-sample under reasonable changes to windows, normalization, and noise controls. Failure modes include correlations driven purely by volatility scaling, sensitivity to outliers/spikes, or effects that disappear after conditioning on liquidity and turnover.
+"""
+
+ideas = [
+    """
+    Rolling correlation as a baseline feature:
+    - Compute rolling or EWM correlations between volume and (abs(return), abs(log-return), or range proxies derived from close).
+    - Test multiple windows (e.g., 24–168 hours) to identify whether microstructure vs slower behavioral effects dominate.
+    - Use robust correlation variants (rank correlation) to reduce outlier sensitivity.
+    """,
+
+    """
+    Directional price–volume correlation:
+    - Use signed returns instead of abs returns to capture “buying pressure on up moves” vs “selling pressure on down moves.”
+    - Hypothesis: positive corr(signed return, volume) indicates trend-following conviction; negative may indicate distribution or absorption.
+    - Test asymmetric correlations: corr(volume, positive returns only) vs corr(volume, negative returns only).
+    """,
+
+    """
+    Correlation change as a regime-shift indicator:
+    - Construct signals from the change in correlation (delta corr) or the divergence between fast and slow correlation estimates.
+    - Hypothesis: rising correlation indicates trend formation / increasing participation; falling correlation indicates trend exhaustion.
+    - Evaluate whether sharp breaks in correlation precede reversals or volatility expansions.
+    """,
+
+    """
+    High correlation = continuation vs exhaustion (nonlinear mapping):
+    - Test both interpretations: (a) high correlation implies continuation (trend confirmation), (b) extremely high correlation implies late-stage blowoff/exhaustion.
+    - Use thresholded or piecewise logic: mid-high correlation supports momentum; extreme correlation triggers caution/contrarian.
+    - Validate whether the relationship is monotonic or hump-shaped.
+    """,
+
+    """
+    Low correlation as a “quality / validity” filter:
+    - Treat low or unstable price–volume coupling as a red flag for noisy markets (weak participation, thin liquidity, potential wash-like patterns).
+    - Use low correlation to downweight other signals (e.g., momentum) rather than as a standalone short.
+    - Test whether low correlation predicts higher future volatility and worse returns after costs.
+    """,
+
+    """
+    Correlation stability and consistency:
+    - Measure stability of correlation estimates over time (vol-of-corr, rolling std of corr, drawdown in corr).
+    - Hypothesis: assets with stable price–volume coupling have more reliable trend dynamics and cleaner execution.
+    - Penalize unstable assets or scale positions inversely with corr-instability.
+    """,
+
+    """
+    Volume conditioning and reliability:
+    - Only trust correlation estimates when volume is sufficiently high relative to baseline (relative volume filter).
+    - Weight correlation observations by volume or use volume-weighted covariance/correlation to emphasize higher-information periods.
+    - Downweight low-volume intervals where correlation is dominated by discrete prints.
+    """,
+
+    """
+    Volume-weighted price change and “efficiency” measures:
+    - Construct features like volume * return, return / volume, or return per unit volume to capture price impact / efficiency.
+    - Hypothesis: large returns on low volume may be fragile (revert), while large returns on high volume may persist (confirm).
+    - Combine with correlation: price impact metrics may explain when correlation is informative.
+    """,
+
+    """
+    Cross-sectional ranking and portfolio construction:
+    - Rank assets cross-sectionally by correlation metrics each hour and test tails: high-corr bucket vs low-corr bucket.
+    - Compare performance conditional on recent returns: does high corr improve momentum Sharpe? does low corr improve reversal Sharpe?
+    - Ensure cross-sectional normalization to remove market-wide volume/volatility regime effects.
+    """,
+
+    """
+    Interaction with volatility (avoid accidental vol timing):
+    - Since abs(return) is tied to volatility, verify the signal isn’t just “high vol assets behave differently.”
+    - Test volatility-scaled returns or use rank correlations to reduce mechanical coupling between vol and correlation estimates.
+    - Compare corr(abs(return), volume) vs corr(|return|/rolling_vol, volume) to isolate “volume response” from “vol level.”
+    """,
+
+    """
+    Diagnostics and falsification tests:
+    - Stress test lookbacks, EWM decay rates, clipping of returns/volume spikes, and correlation estimator choice.
+    - Check whether signal is driven by a few extreme events (spikes) versus broadly distributed behavior.
+    - Evaluate robustness across liquidity cohorts (high-volume vs low-volume assets) to ensure generality.
+    """,
+
+    """
+    Note that turnover may be an issue. If you are finding fitting to 1 period returns is too fast, calculate longer term forward returns and use that to fit any rolling fit signals. Make sure to correctly mask returns though. For example if your forward horizon is K, your rolling window for time T should end data at time T-K.
+    """
+]
+

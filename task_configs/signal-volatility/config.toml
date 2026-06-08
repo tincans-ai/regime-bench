@@ -1,0 +1,123 @@
+# Signal-Volatility Task Configuration
+# Low volatility anomaly signal
+
+[metadata]
+name = "signal-volatility"
+type = "signal"
+difficulty = "medium"
+tags = ["signal", "volatility", "low-vol", "anomaly", "risk"]
+description = "Build low-volatility anomaly signal - does it work in crypto?"
+
+[resources]
+# All defaults from signal_shared.py
+
+[instruction]
+title = "Low Volatility Anomaly Signal Task"
+
+objective = """
+Build a cross-sectional signal that exploits the low volatility anomaly in crypto: assets with lower realized volatility may deliver superior risk-adjusted returns (and potentially higher absolute returns) than high-volatility assets, contrary to the simple “higher risk = higher return” intuition.
+
+The core hypothesis is that crypto market participants systematically overpay for high-volatility “lottery-like” exposure (high upside narratives, convexity, attention-driven pumps), while more stable assets are under-owned because they are perceived as less exciting or offer less headline return potential. If leverage or portfolio construction constraints prevent investors from scaling low-vol exposure to reach target returns, mispricing can persist, creating a cross-sectional premium for low-vol assets.
+
+The research question is whether this effect is present out-of-sample in crypto and whether it survives practical considerations such as heavy-tailed returns, liquidity differences, and strong regime dependence. The intended signal direction is:
+- Long low-volatility assets (more stable realized return paths)
+- Short high-volatility assets (more erratic realized return paths)
+so that the signal is negatively correlated with realized volatility.
+
+Key failure modes include the signal merely capturing liquidity/size effects (low vol = large, liquid assets), dependence on a small subset of regimes (e.g., only risk-off periods), or apparent performance driven by extreme events and estimation noise rather than persistent mispricing.
+"""
+
+
+allowed_features = ["return", "close", "volume", "residual_return"]
+
+ideas = [
+    """
+    Baseline realized volatility signal:
+    - Start with simple realized volatility as rolling std of returns; signal = -realized_vol.
+    - Test multiple lookbacks (short vs medium) to see whether the anomaly is driven by microstructure noise or persistent risk preferences.
+    - Compare non-overlapping vs overlapping return sampling to understand any induced autocorrelation.
+    - Also try using: residual returns to calculate realized vol, normalizing returns by trailing vol then calculating standard deviations
+    """,
+
+    """
+    Cross-sectional normalization for regime robustness:
+    - Use cross-sectional z-scores or ranks of realized volatility per timestamp so the signal is relative (low vol vs peers) rather than absolute.
+    - Hypothesis: the anomaly is primarily cross-sectional (relative preference for “lottery vol” assets) rather than time-series timing of market vol.
+    - Check whether the effect concentrates in the tails (lowest vol decile vs highest vol decile).
+    """,
+
+    """
+    Exponentially weighted volatility and responsiveness:
+    - Use EWMA/EWM volatility to respond more quickly to volatility shifts while reducing window-edge artifacts.
+    - Compare fast vs slow decay to test whether the premium is linked to recent stability or long-run stability.
+    - Consider blending fast and slow vol estimates (term-structure of volatility) as an additional feature.
+    """,
+
+    """
+    Robust volatility measures under heavy tails:
+    - Crypto returns are heavy-tailed; test robust dispersion measures (e.g., median absolute deviation on returns) as alternatives to std.
+    - Winsorize or clip returns before volatility estimation to reduce sensitivity to single liquidation candles.
+    - Compare “raw vol” vs “clipped vol” to diagnose whether results are driven by extreme events.
+    """,
+
+    """
+    Downside / asymmetry-aware volatility:
+    - Compute downside volatility (std of negative returns only) and compare to total volatility.
+    - Hypothesis: markets may overpay for upside lottery exposure while underpricing downside stability, producing stronger anomalies when downside risk is emphasized.
+    - Construct skew-sensitive variants by combining volatility with the sign balance of returns.
+    """,
+
+    """
+    Volatility-of-volatility and stability-of-stability:
+    - Compute vol-of-vol: rolling volatility of the volatility estimate itself.
+    - Hypothesis: assets with not just low volatility but stable volatility command a premium due to risk management constraints and leverage targeting.
+    - Test whether low vol-of-vol predicts returns even after controlling for vol level.
+    """,
+
+    """
+    Relative volatility vs market / common component:
+    - Normalize asset volatility by market volatility (cross-asset average) to isolate idiosyncratic stability.
+    - Compare signals built from absolute vol vs relative vol to determine whether the anomaly is “low risk overall” or “low risk relative to peers.”
+    - If available, use volume as a proxy for liquidity and control for liquidity-linked volatility effects.
+    """,
+
+    """
+    Volatility–liquidity interaction using volume:
+    - Create volatility-per-unit-volume style measures (e.g., vol divided by rolling volume or its log), to separate “high vol because illiquid” from “high vol because speculative.”
+    - Hypothesis: the anomaly may be strongest among more liquid assets where volatility reflects risk preference, not microstructure.
+    - Filter or downweight extremely low-volume assets to reduce noise-driven “fake low vol.”
+    """,
+
+    """
+    Regime conditioning and state dependence:
+    - Condition the low-vol signal on market regime: trend strength, market volatility, or drawdown state.
+    - Hypothesis: in strong bull trends, high-vol assets may dominate (speculative upside), while in risk-off regimes low-vol assets outperform.
+    - Implement regime as a continuous conditioner (scale exposure) rather than a hard on/off switch.
+    """,
+
+    """
+    Interaction with momentum / mean reversion:
+    - Test whether low-vol works best when combined with momentum (e.g., long low-vol assets that also have positive trend).
+    - Alternatively, test whether high-vol assets exhibit mean reversion that can be harvested separately, implying the low-vol signal should avoid certain short-horizon horizons.
+    - Explicitly measure overlap/correlation with basic momentum and reversal signals to ensure the anomaly is distinct.
+    """,
+
+    """
+    Cross-sectional construction and portfolio mechanics:
+    - Consider constructing a market-neutral long/short portfolio via ranks (e.g., long bottom quantile vol, short top quantile vol).
+    - Test sector/cluster neutrality proxies (if no sector labels, use coarse buckets like market-cap ranks or volume ranks) to avoid concentration.
+    - Evaluate whether the premium is driven by a few recurring “meme-like” high-vol names.
+    """,
+
+    """
+    Stability and falsification checks:
+    - Evaluate out-of-sample stability across time (bull/bear/chop) and across asset subsets (top volume vs lower volume).
+    - Stress test sensitivity to lookback choice, clipping thresholds, and normalization approach; robust effects should degrade smoothly.
+    - Ensure the signal does not unintentionally time the market (e.g., becoming net short in high-vol market regimes).
+    """,
+
+    """
+    Note that turnover may be an issue. If you are finding fitting to 1 period returns is too fast, calculate longer term forward returns and use that to fit any rolling fit signals. Make sure to correctly mask returns though. For example if your forward horizon is K, your rolling window for time T should end data at time T-K.
+    """
+]
+

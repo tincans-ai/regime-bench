@@ -1,0 +1,48 @@
+{
+  "benchmark_name": "RegimeBench",
+  "canonical_verifier": "verifier/pnl_verifier.py",
+  "default_causality_gate": true,
+  "default_replay_mode": "strict",
+  "default_scoring_engine": "verifier/repair_verifier.py",
+  "data_bundle": {
+    "file_count": 36,
+    "license": "Apache-2.0",
+    "name": "regime-bench-base-data",
+    "repo_id": "amitvpatel06/regime-bench",
+    "repo_url": "https://huggingface.co/datasets/amitvpatel06/regime-bench",
+    "revision": "eb359fb35abc99930b76cb1bf3495949b98d5376",
+    "total_size_bytes": 1221241781
+  },
+  "license": "Apache-2.0",
+  "reference_smoke": {
+    "expected": "reference_outputs/synthetic_smoke_expected.json",
+    "script": "scripts/reference_smoke.py"
+  },
+  "release_mode": "public_reproducibility_not_blind_leaderboard",
+  "source": {
+    "repo_url": "https://github.com/tincans-ai/regime-bench",
+    "tag": "v0.1.1"
+  },
+  "task_count": 18,
+  "task_names": [
+    "signal-beta",
+    "signal-cnn-volume",
+    "signal-defillama",
+    "signal-funding",
+    "signal-intraday-seasonality",
+    "signal-lottery",
+    "signal-mean-reversion",
+    "signal-ml",
+    "signal-momentum-conditioned",
+    "signal-pair-cluster",
+    "signal-regime-conditioning",
+    "signal-top-trader",
+    "signal-upbit",
+    "signal-volatility",
+    "signal-volume",
+    "signal-volume-price-corr",
+    "signal-volume-time",
+    "signal-weekly-seasonality"
+  ],
+  "version": "0.1.1"
+}
